@@ -441,9 +441,7 @@ async def obter_edicao(
             resposta_json = await resposta_portal.json()
             return resposta_json
 
-            pdf_base64 = localizar_pdf_base64(
-                resposta_json
-            )
+         return resposta_json
 
             termos_busca = [
                 carga.texto_pesquisa,
