@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: funed-diario-service
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: SERVICE_API_KEY
+        generateValue: true
