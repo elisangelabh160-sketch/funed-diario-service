@@ -23,9 +23,10 @@ from pypdf import PdfReader
 PORTAL = "https://www.jornalminasgerais.mg.gov.br"
 SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "").strip()
 
+
 app = FastAPI(
     title="FUNED Diário Oficial Service",
-    version="2.1.0",
+    version="2.2.0",
 )
 
 
@@ -36,7 +37,7 @@ class EdicaoRequest(BaseModel):
 
 
 # ==========================================================
-# AUTENTICAÇÃO DO SERVIÇO
+# AUTENTICAÇÃO DA API DO SERVIÇO
 # ==========================================================
 
 def verificar_chave(valor: str | None) -> None:
@@ -104,7 +105,6 @@ def normalizar_texto(valor: str) -> str:
 
 def limpar_texto_pagina(texto: str) -> str:
     texto = texto.replace("\x00", "")
-
     texto = re.sub(r"[ \t]+", " ", texto)
     texto = re.sub(r"\n[ \t]+", "\n", texto)
     texto = re.sub(r"\n{3,}", "\n\n", texto)
@@ -113,13 +113,33 @@ def limpar_texto_pagina(texto: str) -> str:
 
 
 # ==========================================================
-# VALIDAÇÃO E ABERTURA DO PDF
+# EXTRAÇÃO E VALIDAÇÃO DO PDF
 # ==========================================================
 
 def possui_assinatura_pdf(conteudo: bytes) -> bool:
-    inicio = conteudo[:1024]
+    return b"%PDF-" in conteudo
 
-    return b"%PDF-" in inicio
+
+def extrair_pdf_embutido(conteudo: bytes) -> bytes | None:
+    """
+    Localiza um PDF verdadeiro dentro do conteúdo recebido.
+
+    O portal pode devolver o PDF diretamente ou dentro de um
+    envelope binário, como CMS/PKCS#7.
+    """
+
+    inicio_pdf = conteudo.find(b"%PDF-")
+
+    if inicio_pdf < 0:
+        return None
+
+    fim_pdf = conteudo.rfind(b"%%EOF")
+
+    if fim_pdf >= inicio_pdf:
+        fim_pdf += len(b"%%EOF")
+        return conteudo[inicio_pdf:fim_pdf]
+
+    return conteudo[inicio_pdf:]
 
 
 def extrair_pdf_de_zip(conteudo: bytes) -> bytes | None:
@@ -128,11 +148,9 @@ def extrair_pdf_de_zip(conteudo: bytes) -> bytes | None:
 
     try:
         with zipfile.ZipFile(BytesIO(conteudo)) as arquivo_zip:
-            nomes = arquivo_zip.namelist()
-
             arquivos_pdf = [
                 nome
-                for nome in nomes
+                for nome in arquivo_zip.namelist()
                 if nome.lower().endswith(".pdf")
             ]
 
@@ -146,13 +164,23 @@ def extrair_pdf_de_zip(conteudo: bytes) -> bytes | None:
 
 
 def validar_bytes_pdf(conteudo: bytes) -> bytes:
-    if possui_assinatura_pdf(conteudo):
-        return conteudo
+    pdf_embutido = extrair_pdf_embutido(conteudo)
+
+    if pdf_embutido and possui_assinatura_pdf(pdf_embutido):
+        return pdf_embutido
 
     pdf_zip = extrair_pdf_de_zip(conteudo)
 
-    if pdf_zip and possui_assinatura_pdf(pdf_zip):
-        return pdf_zip
+    if pdf_zip:
+        pdf_embutido_zip = extrair_pdf_embutido(pdf_zip)
+
+        if (
+            pdf_embutido_zip
+            and possui_assinatura_pdf(pdf_embutido_zip)
+        ):
+            return pdf_embutido_zip
+
+    inicio_hexadecimal = conteudo[:80].hex()
 
     inicio_legivel = conteudo[:200].decode(
         "utf-8",
@@ -163,9 +191,10 @@ def validar_bytes_pdf(conteudo: bytes) -> bytes:
         status_code=502,
         detail={
             "mensagem": (
-                "O conteúdo obtido não possui a assinatura de um PDF válido."
+                "O conteúdo recebido não contém um PDF válido."
             ),
             "tamanhoBytes": len(conteudo),
+            "inicioHexadecimal": inicio_hexadecimal,
             "inicioConteudo": inicio_legivel,
         },
     )
@@ -188,7 +217,6 @@ def tentar_decodificar_base64(valor: str) -> bytes | None:
 
     tentativas = [texto]
 
-    # Base64 pode chegar sem o preenchimento "=".
     restante = len(texto) % 4
 
     if restante:
@@ -213,7 +241,7 @@ def tentar_decodificar_base64(valor: str) -> bytes | None:
 
 
 # ==========================================================
-# BUSCA RECURSIVA DE CANDIDATOS NO JSON
+# BUSCA DE ARQUIVO OU URL NO JSON DO PORTAL
 # ==========================================================
 
 def coletar_candidatos_arquivo(
@@ -287,7 +315,7 @@ def parece_url(valor: str) -> bool:
 
 
 # ==========================================================
-# DOWNLOAD DO PDF
+# DOWNLOAD DO ARQUIVO
 # ==========================================================
 
 async def baixar_arquivo(
@@ -333,15 +361,18 @@ async def baixar_arquivo(
 
     conteudo = await resposta.body()
 
+    pdf_bytes = validar_bytes_pdf(conteudo)
+
     diagnostico = {
         "origem": "url",
         "url": url_absoluta,
         "status": resposta.status,
         "contentType": content_type,
-        "tamanhoBytes": len(conteudo),
+        "tamanhoRecebidoBytes": len(conteudo),
+        "tamanhoPdfExtraidoBytes": len(pdf_bytes),
     }
 
-    return validar_bytes_pdf(conteudo), diagnostico
+    return pdf_bytes, diagnostico
 
 
 async def localizar_e_obter_pdf(
@@ -369,7 +400,6 @@ async def localizar_e_obter_pdf(
 
     erros_candidatos: list[dict[str, Any]] = []
 
-    # Primeiro tenta URLs, pois o portal pode devolver um link assinado.
     candidatos_ordenados = sorted(
         candidatos,
         key=lambda item: (
@@ -383,20 +413,18 @@ async def localizar_e_obter_pdf(
 
         try:
             if parece_url(valor):
-                pdf_bytes, diagnostico = (
-                    await baixar_arquivo(
-                        requisicoes=requisicoes,
-                        url=valor,
-                        bearer_token=bearer_token,
-                    )
+                pdf_bytes, diagnostico = await baixar_arquivo(
+                    requisicoes=requisicoes,
+                    url=valor,
+                    bearer_token=bearer_token,
                 )
 
                 diagnostico["campoOrigem"] = caminho
 
                 return pdf_bytes, diagnostico
 
-            bytes_decodificados = (
-                tentar_decodificar_base64(valor)
+            bytes_decodificados = tentar_decodificar_base64(
+                valor
             )
 
             if bytes_decodificados:
@@ -407,7 +435,12 @@ async def localizar_e_obter_pdf(
                 return pdf_bytes, {
                     "origem": "base64",
                     "campoOrigem": caminho,
-                    "tamanhoBytes": len(pdf_bytes),
+                    "tamanhoRecebidoBytes": len(
+                        bytes_decodificados
+                    ),
+                    "tamanhoPdfExtraidoBytes": len(
+                        pdf_bytes
+                    ),
                 }
 
         except HTTPException as erro:
@@ -423,6 +456,7 @@ async def localizar_e_obter_pdf(
                 {
                     "campo": caminho,
                     "erro": str(erro),
+                    "tipo": type(erro).__name__,
                 }
             )
 
@@ -440,7 +474,7 @@ async def localizar_e_obter_pdf(
 
 
 # ==========================================================
-# EXTRAÇÃO DO TEXTO DO PDF
+# EXTRAÇÃO DO TEXTO DAS PÁGINAS
 # ==========================================================
 
 def extrair_publicacoes_pdf(
@@ -458,11 +492,18 @@ def extrair_publicacoes_pdf(
             status_code=502,
             detail={
                 "mensagem": (
-                    "O arquivo possui assinatura PDF, mas não "
-                    "pôde ser aberto pelo pypdf."
+                    "O PDF foi extraído, mas não pôde ser "
+                    "aberto pelo pypdf."
                 ),
                 "erro": str(erro),
+                "tipo": type(erro).__name__,
                 "tamanhoBytes": len(pdf_bytes),
+                "inicioArquivo": (
+                    pdf_bytes[:20].decode(
+                        "latin-1",
+                        errors="replace",
+                    )
+                ),
             },
         ) from erro
 
@@ -471,7 +512,10 @@ def extrair_publicacoes_pdf(
     for termo in termos:
         termo_limpo = termo.strip()
 
-        if termo_limpo and termo_limpo not in termos_unicos:
+        if (
+            termo_limpo
+            and termo_limpo not in termos_unicos
+        ):
             termos_unicos.append(termo_limpo)
 
     termos_normalizados = [
@@ -486,9 +530,7 @@ def extrair_publicacoes_pdf(
         numero_pagina = indice + 1
 
         try:
-            texto_extraido = (
-                pagina.extract_text() or ""
-            )
+            texto_extraido = pagina.extract_text() or ""
 
         except Exception:
             texto_extraido = ""
@@ -555,7 +597,7 @@ async def raiz() -> dict[str, str]:
     return {
         "servico": "FUNED Diário Oficial",
         "status": "online",
-        "versao": "2.1.0",
+        "versao": "2.2.0",
     }
 
 
@@ -563,7 +605,7 @@ async def raiz() -> dict[str, str]:
 async def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "versao": "2.1.0",
+        "versao": "2.2.0",
     }
 
 
@@ -610,10 +652,8 @@ async def obter_edicao(
         def capturar_token(requisicao) -> None:
             nonlocal token_capturado
 
-            authorization = (
-                requisicao.headers.get(
-                    "authorization"
-                )
+            authorization = requisicao.headers.get(
+                "authorization"
             )
 
             if (
@@ -688,8 +728,7 @@ async def obter_edicao(
                         i < localStorage.length;
                         i++
                       ) {
-                        const chave =
-                          localStorage.key(i);
+                        const chave = localStorage.key(i);
 
                         local[chave] =
                           localStorage.getItem(chave);
@@ -700,8 +739,7 @@ async def obter_edicao(
                         i < sessionStorage.length;
                         i++
                       ) {
-                        const chave =
-                          sessionStorage.key(i);
+                        const chave = sessionStorage.key(i);
 
                         session[chave] =
                           sessionStorage.getItem(chave);
@@ -715,19 +753,15 @@ async def obter_edicao(
                     """
                 )
 
-                token_capturado = (
-                    localizar_token_em_valor(
-                        armazenamentos
-                    )
+                token_capturado = localizar_token_em_valor(
+                    armazenamentos
                 )
 
             if not token_capturado:
                 cookies = await contexto.cookies()
 
-                token_capturado = (
-                    localizar_token_em_valor(
-                        cookies
-                    )
+                token_capturado = localizar_token_em_valor(
+                    cookies
                 )
 
             if not token_capturado:
@@ -745,61 +779,44 @@ async def obter_edicao(
                 f"{carga.id_jornal}"
             )
 
-            resposta_portal = (
-                await contexto.request.get(
-                    url_edicao,
-                    headers={
-                        "Authorization": (
-                            token_capturado
-                        ),
-                        "Accept": (
-                            "application/json"
-                        ),
-                    },
-                    timeout=120_000,
-                    fail_on_status_code=False,
-                )
+            resposta_portal = await contexto.request.get(
+                url_edicao,
+                headers={
+                    "Authorization": token_capturado,
+                    "Accept": "application/json",
+                },
+                timeout=120_000,
+                fail_on_status_code=False,
             )
 
             if not resposta_portal.ok:
-                texto_erro = (
-                    await resposta_portal.text()
-                )
+                texto_erro = await resposta_portal.text()
 
                 raise HTTPException(
                     status_code=502,
                     detail={
                         "mensagem": (
-                            "O portal recusou a "
-                            "consulta da edição."
+                            "O portal recusou a consulta "
+                            "da edição."
                         ),
-                        "status": (
-                            resposta_portal.status
-                        ),
+                        "status": resposta_portal.status,
                         "resposta": texto_erro[:500],
                     },
                 )
 
             try:
-                resposta_json = (
-                    await resposta_portal.json()
-                )
+                resposta_json = await resposta_portal.json()
 
             except Exception as erro:
-                texto_resposta = (
-                    await resposta_portal.text()
-                )
+                texto_resposta = await resposta_portal.text()
 
                 raise HTTPException(
                     status_code=502,
                     detail={
                         "mensagem": (
-                            "O portal não retornou "
-                            "um JSON válido."
+                            "O portal não retornou um JSON válido."
                         ),
-                        "resposta": (
-                            texto_resposta[:500]
-                        ),
+                        "resposta": texto_resposta[:500],
                     },
                 ) from erro
 
@@ -818,15 +835,14 @@ async def obter_edicao(
                 "Funed",
             ]
 
-            resultado_extracao = (
-                extrair_publicacoes_pdf(
-                    pdf_bytes=pdf_bytes,
-                    termos=termos_busca,
-                )
+            resultado_extracao = extrair_publicacoes_pdf(
+                pdf_bytes=pdf_bytes,
+                termos=termos_busca,
             )
 
-            dados_originais = (
-                resposta_json.get("dados", {})
+            dados_originais = resposta_json.get(
+                "dados",
+                {},
             )
 
             cadernos = []
@@ -841,8 +857,7 @@ async def obter_edicao(
                 "dados": {
                     "idJornal": carga.id_jornal,
                     "dataPublicacao": (
-                        carga.data_publicacao
-                        .isoformat()
+                        carga.data_publicacao.isoformat()
                     ),
                     "textoPesquisa": (
                         carga.texto_pesquisa
@@ -884,8 +899,7 @@ async def obter_edicao(
             raise HTTPException(
                 status_code=504,
                 detail=(
-                    "O portal demorou demais "
-                    "para responder."
+                    "O portal demorou demais para responder."
                 ),
             ) from erro
 
@@ -897,8 +911,7 @@ async def obter_edicao(
                 status_code=502,
                 detail={
                     "mensagem": (
-                        "Falha inesperada ao "
-                        "processar a edição."
+                        "Falha inesperada ao processar a edição."
                     ),
                     "erro": str(erro),
                     "tipo": type(erro).__name__,
