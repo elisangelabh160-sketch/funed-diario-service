@@ -26,9 +26,13 @@ from pypdf import PdfReader
 PORTAL = "https://www.jornalminasgerais.mg.gov.br"
 SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "").strip()
 
+MAX_TENTATIVAS_MONITORAMENTO = 4
+ESPERAS_MONITORAMENTO_SEGUNDOS = [5, 10, 20]
+STATUS_REPETIVEIS = {401, 408, 429, 500, 502, 503, 504}
+
 app = FastAPI(
     title="FUNED Diário Oficial Service",
-    version="3.2.0",
+    version="3.3.0",
 )
 
 
@@ -875,7 +879,7 @@ async def processar_edicao(
     }
 
 
-async def executar_monitoramento(
+async def executar_monitoramento_uma_vez(
     carga: MonitoramentoRequest,
     id_jornal: int | None = None,
 ) -> dict[str, Any]:
@@ -939,12 +943,120 @@ async def executar_monitoramento(
             await navegador.close()
 
 
+def erro_repetivel(erro: Exception) -> bool:
+    """Indica se a falha admite nova tentativa automática."""
+    if isinstance(erro, HTTPException):
+        return erro.status_code in STATUS_REPETIVEIS
+
+    return isinstance(
+        erro,
+        (
+            PlaywrightTimeoutError,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+        ),
+    )
+
+
+def resumir_erro(erro: Exception) -> dict[str, Any]:
+    if isinstance(erro, HTTPException):
+        return {
+            "tipo": type(erro).__name__,
+            "status": erro.status_code,
+            "detalhe": erro.detail,
+        }
+
+    return {
+        "tipo": type(erro).__name__,
+        "detalhe": str(erro),
+    }
+
+
+async def executar_monitoramento(
+    carga: MonitoramentoRequest,
+    id_jornal: int | None = None,
+) -> dict[str, Any]:
+    """
+    Executa o monitoramento com backoff progressivo:
+    tentativa imediata; depois 5 s, 10 s e 20 s.
+    """
+    historico_erros: list[dict[str, Any]] = []
+
+    for tentativa in range(1, MAX_TENTATIVAS_MONITORAMENTO + 1):
+        try:
+            resultado = await executar_monitoramento_uma_vez(
+                carga,
+                id_jornal=id_jornal,
+            )
+
+            dados = resultado.setdefault("dados", {})
+            dados["tentativaUtilizada"] = tentativa
+            dados["totalTentativasPermitidas"] = (
+                MAX_TENTATIVAS_MONITORAMENTO
+            )
+
+            if historico_erros:
+                resultado["tentativasAnteriores"] = historico_erros
+
+            return resultado
+
+        except Exception as erro:
+            historico_erros.append(
+                {
+                    "tentativa": tentativa,
+                    **resumir_erro(erro),
+                }
+            )
+
+            ultima_tentativa = (
+                tentativa >= MAX_TENTATIVAS_MONITORAMENTO
+            )
+
+            if ultima_tentativa or not erro_repetivel(erro):
+                if isinstance(erro, HTTPException):
+                    raise HTTPException(
+                        status_code=erro.status_code,
+                        detail={
+                            "mensagem": (
+                                "O monitoramento não pôde ser concluído."
+                            ),
+                            "erroFinal": erro.detail,
+                            "tentativas": historico_erros,
+                        },
+                    ) from erro
+
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "mensagem": (
+                            "O monitoramento falhou após as tentativas "
+                            "automáticas."
+                        ),
+                        "tentativas": historico_erros,
+                    },
+                ) from erro
+
+            espera = ESPERAS_MONITORAMENTO_SEGUNDOS[
+                tentativa - 1
+            ]
+            await asyncio.sleep(espera)
+
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "mensagem": "Falha inesperada no mecanismo de tentativas.",
+            "tentativas": historico_erros,
+        },
+    )
+
+
 @app.get("/")
 async def raiz() -> dict[str, str]:
     return {
         "servico": "FUNED Diário Oficial",
         "status": "online",
-        "versao": "3.2.0",
+        "versao": "3.3.0",
     }
 
 
@@ -952,7 +1064,7 @@ async def raiz() -> dict[str, str]:
 async def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "versao": "3.2.0",
+        "versao": "3.3.0",
     }
 
 
