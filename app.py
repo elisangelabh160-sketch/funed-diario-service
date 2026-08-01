@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import binascii
 import json
@@ -9,7 +8,7 @@ import zipfile
 from datetime import date
 from io import BytesIO
 from typing import Any
-from urllib.parse import quote, urljoin
+from urllib.parse import urlencode, urljoin
 
 from fastapi import FastAPI, Header, HTTPException
 from playwright.async_api import (
@@ -28,7 +27,7 @@ SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "").strip()
 
 app = FastAPI(
     title="FUNED Diário Oficial Service",
-    version="3.0.0",
+    version="3.1.0",
 )
 
 
@@ -470,96 +469,161 @@ async def localizar_token(
 
 
 async def pesquisar_id_jornal(
-    pagina: Page,
+    contexto: BrowserContext,
+    token: str,
     carga: MonitoramentoRequest,
 ) -> tuple[int, dict[str, Any]]:
-    dados_pesquisa = {
-        "PaginaAtual": 1,
-        "TamanhoPagina": 20,
-        "textoPesquisa": carga.texto_pesquisa,
-        "dataPublicacaoInicial": carga.data_publicacao.isoformat(),
-        "dataPublicacaoFinal": carga.data_publicacao.isoformat(),
-        "DiarioExecutivo": True,
-        "Municipios": False,
-        "Terceiros": False,
-        "EdicaoExtra": False,
+    """
+    Pesquisa diretamente na API interna do portal usando um Bearer
+    obtido automaticamente pelo Playwright.
+
+    O n8n não precisa armazenar nem renovar o Authorization do portal.
+    """
+
+    parametros = {
+        "DataPublicacaoInicial": carga.data_publicacao.isoformat(),
+        "DataPublicacaoFinal": carga.data_publicacao.isoformat(),
+        "TextoPesquisa": carga.texto_pesquisa,
+        "DiarioExecutivo": "true",
+        "DiarioMunicipios": "false",
+        "DiarioTerceiros": "false",
+        "EdicaoExtra": "false",
+        "PaginaAtual": "1",
+        "TamanhoPagina": "20",
     }
 
     url_pesquisa = (
-        f"{PORTAL}/pesquisa?dadosPesquisa="
-        f"{quote(json.dumps(dados_pesquisa, ensure_ascii=False))}"
+        f"{PORTAL}/api/v1/Pesquisa/PesquisarJornaisPaginados?"
+        f"{urlencode(parametros)}"
     )
 
-    loop = asyncio.get_running_loop()
-    resposta_futura: asyncio.Future[dict[str, Any]] = (
-        loop.create_future()
+    resposta = await contexto.request.get(
+        url_pesquisa,
+        headers={
+            "Authorization": token,
+            "Accept": "application/json",
+            "Referer": f"{PORTAL}/pesquisa",
+        },
+        timeout=120_000,
+        fail_on_status_code=False,
     )
 
-    async def processar_resposta(resposta) -> None:
-        if (
-            "PesquisarJornaisPaginados"
-            not in resposta.url
-            or resposta_futura.done()
-        ):
-            return
+    if not resposta.ok:
+        texto_erro = await resposta.text()
 
-        try:
-            resposta_futura.set_result(await resposta.json())
-        except Exception as erro:
-            resposta_futura.set_exception(erro)
-
-    def ao_receber_resposta(resposta) -> None:
-        asyncio.create_task(processar_resposta(resposta))
-
-    pagina.on("response", ao_receber_resposta)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "mensagem": "O portal recusou a pesquisa das edições.",
+                "status": resposta.status,
+                "url": url_pesquisa,
+                "resposta": texto_erro[:1000],
+            },
+        )
 
     try:
-        await pagina.goto(
-            url_pesquisa,
-            wait_until="domcontentloaded",
-            timeout=90_000,
-        )
+        resposta_json = await resposta.json()
+    except Exception as erro:
+        texto_resposta = await resposta.text()
 
-        resposta_json = await asyncio.wait_for(
-            resposta_futura,
-            timeout=60,
-        )
-    except asyncio.TimeoutError as erro:
         raise HTTPException(
-            status_code=504,
-            detail="A pesquisa do portal não retornou a lista de edições.",
+            status_code=502,
+            detail={
+                "mensagem": (
+                    "A pesquisa das edições não retornou um JSON válido."
+                ),
+                "resposta": texto_resposta[:1000],
+            },
         ) from erro
-    finally:
-        pagina.remove_listener("response", ao_receber_resposta)
 
     resultados = resposta_json.get("dados", [])
+
+    # Alguns retornos podem envolver a lista em outro objeto "dados".
+    if isinstance(resultados, dict):
+        resultados = (
+            resultados.get("dados")
+            or resultados.get("itens")
+            or resultados.get("resultados")
+            or []
+        )
 
     if not isinstance(resultados, list) or not resultados:
         raise HTTPException(
             status_code=404,
-            detail=(
-                "Nenhuma edição com a expressão pesquisada foi "
-                "localizada na data informada."
-            ),
+            detail={
+                "mensagem": (
+                    "Nenhuma edição com a expressão pesquisada foi "
+                    "localizada na data informada."
+                ),
+                "dataPublicacao": carga.data_publicacao.isoformat(),
+                "textoPesquisa": carga.texto_pesquisa,
+                "respostaPortal": resposta_json,
+            },
         )
 
-    candidatos = [
+    candidatos_executivo = [
         item
         for item in resultados
         if isinstance(item, dict)
-        and "executivo" in str(
-            item.get("tipoCaderno", "")
-        ).lower()
+        and "executivo" in normalizar_texto(
+            str(
+                item.get("tipoCaderno")
+                or item.get("descricaoCaderno")
+                or item.get("caderno")
+                or ""
+            )
+        )
     ]
 
-    escolhido = candidatos[0] if candidatos else resultados[0]
-    id_jornal = escolhido.get("idJornal")
+    candidatos_com_id = [
+        item
+        for item in (candidatos_executivo or resultados)
+        if isinstance(item, dict)
+        and (
+            item.get("idJornal")
+            or item.get("IdJornal")
+            or item.get("id")
+        )
+    ]
 
-    if not id_jornal:
+    if not candidatos_com_id:
         raise HTTPException(
             status_code=502,
-            detail="A pesquisa retornou resultado sem idJornal.",
+            detail={
+                "mensagem": (
+                    "A pesquisa retornou resultados, mas nenhum deles "
+                    "possui um identificador de edição."
+                ),
+                "resultados": resultados[:10],
+            },
         )
+
+    # Prioriza resultado que menciona diretamente o termo pesquisado.
+    termo_normalizado = normalizar_texto(carga.texto_pesquisa)
+
+    candidatos_ordenados = sorted(
+        candidatos_com_id,
+        key=lambda item: (
+            0
+            if termo_normalizado
+            in normalizar_texto(
+                " ".join(
+                    str(valor)
+                    for valor in item.values()
+                    if valor is not None
+                )
+            )
+            else 1
+        ),
+    )
+
+    escolhido = candidatos_ordenados[0]
+
+    id_jornal = (
+        escolhido.get("idJornal")
+        or escolhido.get("IdJornal")
+        or escolhido.get("id")
+    )
 
     return int(id_jornal), escolhido
 
@@ -668,7 +732,7 @@ async def executar_monitoramento(
 
             if id_jornal is None:
                 id_jornal, resultado_pesquisa = (
-                    await pesquisar_id_jornal(pagina, carga)
+                    await pesquisar_id_jornal(contexto, token, carga)
                 )
 
             return await processar_edicao(
@@ -695,7 +759,7 @@ async def raiz() -> dict[str, str]:
     return {
         "servico": "FUNED Diário Oficial",
         "status": "online",
-        "versao": "3.0.0",
+        "versao": "3.1.0",
     }
 
 
@@ -703,7 +767,7 @@ async def raiz() -> dict[str, str]:
 async def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "versao": "3.0.0",
+        "versao": "3.1.0",
     }
 
 
