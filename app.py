@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import binascii
 import json
@@ -8,7 +9,7 @@ import zipfile
 from datetime import date
 from io import BytesIO
 from typing import Any
-from urllib.parse import urlencode, urljoin
+from urllib.parse import quote, urljoin
 
 from fastapi import FastAPI, Header, HTTPException
 from playwright.async_api import (
@@ -27,7 +28,7 @@ SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "").strip()
 
 app = FastAPI(
     title="FUNED Diário Oficial Service",
-    version="3.1.0",
+    version="3.2.0",
 )
 
 
@@ -468,164 +469,339 @@ async def localizar_token(
     return token_capturado
 
 
-async def pesquisar_id_jornal(
-    contexto: BrowserContext,
-    token: str,
+async def pesquisar_id_jornal_pela_interface(
+    pagina: Page,
     carga: MonitoramentoRequest,
-) -> tuple[int, dict[str, Any]]:
+) -> tuple[int, dict[str, Any], str]:
     """
-    Pesquisa diretamente na API interna do portal usando um Bearer
-    obtido automaticamente pelo Playwright.
+    Executa a pesquisa pela própria interface pública do portal.
 
-    O n8n não precisa armazenar nem renovar o Authorization do portal.
+    O Playwright preenche os campos, aciona o botão PESQUISAR e
+    intercepta a resposta real de PesquisarJornaisPaginados. Assim,
+    o serviço não armazena nem renova manualmente o Bearer do portal.
     """
 
-    parametros = {
-        "DataPublicacaoInicial": carga.data_publicacao.isoformat(),
-        "DataPublicacaoFinal": carga.data_publicacao.isoformat(),
-        "TextoPesquisa": carga.texto_pesquisa,
-        "DiarioExecutivo": "true",
-        "DiarioMunicipios": "false",
-        "DiarioTerceiros": "false",
-        "EdicaoExtra": "false",
-        "PaginaAtual": "1",
-        "TamanhoPagina": "20",
-    }
+    token_capturado: str | None = None
 
-    url_pesquisa = (
-        f"{PORTAL}/api/v1/Pesquisa/PesquisarJornaisPaginados?"
-        f"{urlencode(parametros)}"
-    )
+    def capturar_token(requisicao) -> None:
+        nonlocal token_capturado
 
-    resposta = await contexto.request.get(
-        url_pesquisa,
-        headers={
-            "Authorization": token,
-            "Accept": "application/json",
-            "Referer": f"{PORTAL}/pesquisa",
-        },
-        timeout=120_000,
-        fail_on_status_code=False,
-    )
+        authorization = requisicao.headers.get("authorization")
 
-    if not resposta.ok:
-        texto_erro = await resposta.text()
+        if (
+            authorization
+            and authorization.startswith("Bearer ")
+        ):
+            token_capturado = authorization
 
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "mensagem": "O portal recusou a pesquisa das edições.",
-                "status": resposta.status,
-                "url": url_pesquisa,
-                "resposta": texto_erro[:1000],
-            },
-        )
+    pagina.on("request", capturar_token)
 
     try:
-        resposta_json = await resposta.json()
-    except Exception as erro:
-        texto_resposta = await resposta.text()
-
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "mensagem": (
-                    "A pesquisa das edições não retornou um JSON válido."
-                ),
-                "resposta": texto_resposta[:1000],
-            },
-        ) from erro
-
-    resultados = resposta_json.get("dados", [])
-
-    # Alguns retornos podem envolver a lista em outro objeto "dados".
-    if isinstance(resultados, dict):
-        resultados = (
-            resultados.get("dados")
-            or resultados.get("itens")
-            or resultados.get("resultados")
-            or []
+        await pagina.goto(
+            f"{PORTAL}/pesquisa",
+            wait_until="domcontentloaded",
+            timeout=90_000,
         )
 
-    if not isinstance(resultados, list) or not resultados:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "mensagem": (
-                    "Nenhuma edição com a expressão pesquisada foi "
-                    "localizada na data informada."
-                ),
-                "dataPublicacao": carga.data_publicacao.isoformat(),
-                "textoPesquisa": carga.texto_pesquisa,
-                "respostaPortal": resposta_json,
-            },
-        )
+        await pagina.wait_for_timeout(3_000)
 
-    candidatos_executivo = [
-        item
-        for item in resultados
-        if isinstance(item, dict)
-        and "executivo" in normalizar_texto(
-            str(
-                item.get("tipoCaderno")
-                or item.get("descricaoCaderno")
-                or item.get("caderno")
-                or ""
+        # Campo de texto: usa rótulos e fallbacks para reduzir
+        # dependência de classes ou IDs internos do portal.
+        campo_texto = pagina.get_by_label(
+            re.compile(
+                r"palavra|frase|conte[uú]do",
+                re.IGNORECASE,
             )
         )
-    ]
 
-    candidatos_com_id = [
-        item
-        for item in (candidatos_executivo or resultados)
-        if isinstance(item, dict)
-        and (
-            item.get("idJornal")
-            or item.get("IdJornal")
-            or item.get("id")
-        )
-    ]
+        if await campo_texto.count() == 0:
+            campo_texto = pagina.locator(
+                'input[type="text"]'
+            ).first
 
-    if not candidatos_com_id:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "mensagem": (
-                    "A pesquisa retornou resultados, mas nenhum deles "
-                    "possui um identificador de edição."
-                ),
-                "resultados": resultados[:10],
-            },
+        await campo_texto.fill(carga.texto_pesquisa)
+
+        campos_data = pagina.locator(
+            'input[type="date"], input[placeholder*="/"]'
         )
 
-    # Prioriza resultado que menciona diretamente o termo pesquisado.
-    termo_normalizado = normalizar_texto(carga.texto_pesquisa)
+        quantidade_datas = await campos_data.count()
 
-    candidatos_ordenados = sorted(
-        candidatos_com_id,
-        key=lambda item: (
-            0
-            if termo_normalizado
-            in normalizar_texto(
-                " ".join(
-                    str(valor)
-                    for valor in item.values()
-                    if valor is not None
+        if quantidade_datas < 2:
+            campos_data = pagina.locator(
+                'input'
+            ).filter(
+                has=pagina.locator(
+                    '[type="date"]'
                 )
             )
-            else 1
-        ),
-    )
 
-    escolhido = candidatos_ordenados[0]
+        data_br = carga.data_publicacao.strftime("%d/%m/%Y")
+        data_iso = carga.data_publicacao.isoformat()
 
-    id_jornal = (
-        escolhido.get("idJornal")
-        or escolhido.get("IdJornal")
-        or escolhido.get("id")
-    )
+        # Primeiro tenta preencher pelos rótulos.
+        data_inicial = pagina.get_by_label(
+            re.compile(
+                r"data\s*inicial",
+                re.IGNORECASE,
+            )
+        )
+        data_final = pagina.get_by_label(
+            re.compile(
+                r"data\s*final",
+                re.IGNORECASE,
+            )
+        )
 
-    return int(id_jornal), escolhido
+        if await data_inicial.count() > 0:
+            try:
+                await data_inicial.fill(data_iso)
+            except Exception:
+                await data_inicial.fill(data_br)
+        elif await campos_data.count() >= 1:
+            try:
+                await campos_data.nth(0).fill(data_iso)
+            except Exception:
+                await campos_data.nth(0).fill(data_br)
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail="O campo Data Inicial não foi localizado no portal.",
+            )
+
+        if await data_final.count() > 0:
+            try:
+                await data_final.fill(data_iso)
+            except Exception:
+                await data_final.fill(data_br)
+        elif await campos_data.count() >= 2:
+            try:
+                await campos_data.nth(1).fill(data_iso)
+            except Exception:
+                await campos_data.nth(1).fill(data_br)
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail="O campo Data Final não foi localizado no portal.",
+            )
+
+        # Mantém o Diário do Executivo selecionado. Caso o portal
+        # use checkbox, garante o estado marcado.
+        executivo = pagina.get_by_text(
+            re.compile(
+                r"di[aá]rio do executivo",
+                re.IGNORECASE,
+            )
+        )
+
+        if await executivo.count() > 0:
+            elemento = executivo.first
+
+            try:
+                checkbox = elemento.locator(
+                    'xpath=preceding::input[@type="checkbox"][1]'
+                )
+
+                if (
+                    await checkbox.count() > 0
+                    and not await checkbox.is_checked()
+                ):
+                    await checkbox.check(force=True)
+            except Exception:
+                # Alguns layouts usam botão visual, não checkbox.
+                # Nesse caso, preservamos o estado padrão do portal.
+                pass
+
+        botao_pesquisar = pagina.get_by_role(
+            "button",
+            name=re.compile(
+                r"pesquisar",
+                re.IGNORECASE,
+            ),
+        )
+
+        if await botao_pesquisar.count() == 0:
+            botao_pesquisar = pagina.locator(
+                'button, input[type="submit"]'
+            ).filter(
+                has_text=re.compile(
+                    r"pesquisar",
+                    re.IGNORECASE,
+                )
+            )
+
+        if await botao_pesquisar.count() == 0:
+            raise HTTPException(
+                status_code=502,
+                detail="O botão PESQUISAR não foi localizado no portal.",
+            )
+
+        try:
+            async with pagina.expect_response(
+                lambda resposta: (
+                    "PesquisarJornaisPaginados"
+                    in resposta.url
+                ),
+                timeout=90_000,
+            ) as resposta_esperada:
+                await botao_pesquisar.first.click()
+
+            resposta_pesquisa = await resposta_esperada.value
+
+        except PlaywrightTimeoutError as erro:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    "O portal não retornou a resposta da pesquisa "
+                    "após o clique em PESQUISAR."
+                ),
+            ) from erro
+
+        if not resposta_pesquisa.ok:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "mensagem": (
+                        "A pesquisa realizada pela interface foi recusada."
+                    ),
+                    "status": resposta_pesquisa.status,
+                    "url": resposta_pesquisa.url,
+                    "resposta": (
+                        await resposta_pesquisa.text()
+                    )[:1000],
+                },
+            )
+
+        # O token efetivamente usado na pesquisa é a fonte de verdade.
+        authorization_real = (
+            resposta_pesquisa.request.headers.get(
+                "authorization"
+            )
+        )
+
+        if (
+            authorization_real
+            and authorization_real.startswith("Bearer ")
+        ):
+            token_capturado = authorization_real
+
+        if not token_capturado:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "A pesquisa funcionou, mas o Authorization usado "
+                    "pelo próprio portal não foi capturado."
+                ),
+            )
+
+        try:
+            resposta_json = await resposta_pesquisa.json()
+        except Exception as erro:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "mensagem": (
+                        "A resposta da pesquisa não contém JSON válido."
+                    ),
+                    "resposta": (
+                        await resposta_pesquisa.text()
+                    )[:1000],
+                },
+            ) from erro
+
+        resultados = resposta_json.get("dados", [])
+
+        if isinstance(resultados, dict):
+            resultados = (
+                resultados.get("dados")
+                or resultados.get("itens")
+                or resultados.get("resultados")
+                or []
+            )
+
+        if not isinstance(resultados, list) or not resultados:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "mensagem": (
+                        "Nenhuma publicação foi localizada na data "
+                        "e com a expressão informadas."
+                    ),
+                    "dataPublicacao": (
+                        carga.data_publicacao.isoformat()
+                    ),
+                    "textoPesquisa": carga.texto_pesquisa,
+                },
+            )
+
+        candidatos_executivo = [
+            item
+            for item in resultados
+            if isinstance(item, dict)
+            and "executivo" in normalizar_texto(
+                str(
+                    item.get("tipoCaderno")
+                    or item.get("descricaoCaderno")
+                    or item.get("caderno")
+                    or ""
+                )
+            )
+        ]
+
+        candidatos = candidatos_executivo or resultados
+
+        candidatos_com_id = [
+            item
+            for item in candidatos
+            if isinstance(item, dict)
+            and (
+                item.get("idJornal")
+                or item.get("IdJornal")
+                or item.get("id")
+            )
+        ]
+
+        if not candidatos_com_id:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "mensagem": (
+                        "A pesquisa retornou resultados, mas nenhum "
+                        "possui idJornal."
+                    ),
+                    "resultados": resultados[:10],
+                },
+            )
+
+        # Prioriza o resultado que contém o termo pesquisado.
+        termo = normalizar_texto(carga.texto_pesquisa)
+
+        candidatos_com_id.sort(
+            key=lambda item: (
+                0
+                if termo in normalizar_texto(
+                    " ".join(
+                        str(valor)
+                        for valor in item.values()
+                        if valor is not None
+                    )
+                )
+                else 1
+            )
+        )
+
+        escolhido = candidatos_com_id[0]
+
+        id_jornal = (
+            escolhido.get("idJornal")
+            or escolhido.get("IdJornal")
+            or escolhido.get("id")
+        )
+
+        return int(id_jornal), escolhido, token_capturado
+
+    finally:
+        pagina.remove_listener("request", capturar_token)
 
 
 async def processar_edicao(
@@ -727,12 +903,21 @@ async def executar_monitoramento(
         pagina = await contexto.new_page()
 
         try:
-            token = await localizar_token(pagina, contexto)
             resultado_pesquisa = None
 
             if id_jornal is None:
-                id_jornal, resultado_pesquisa = (
-                    await pesquisar_id_jornal(contexto, token, carga)
+                (
+                    id_jornal,
+                    resultado_pesquisa,
+                    token,
+                ) = await pesquisar_id_jornal_pela_interface(
+                    pagina,
+                    carga,
+                )
+            else:
+                token = await localizar_token(
+                    pagina,
+                    contexto,
                 )
 
             return await processar_edicao(
@@ -759,7 +944,7 @@ async def raiz() -> dict[str, str]:
     return {
         "servico": "FUNED Diário Oficial",
         "status": "online",
-        "versao": "3.1.0",
+        "versao": "3.2.0",
     }
 
 
@@ -767,7 +952,7 @@ async def raiz() -> dict[str, str]:
 async def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "versao": "3.1.0",
+        "versao": "3.2.0",
     }
 
 
