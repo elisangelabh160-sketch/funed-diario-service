@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import binascii
 import json
@@ -13,6 +14,8 @@ from urllib.parse import quote, urljoin
 from fastapi import FastAPI, Header, HTTPException
 from playwright.async_api import (
     APIRequestContext,
+    BrowserContext,
+    Page,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
@@ -23,22 +26,20 @@ from pypdf import PdfReader
 PORTAL = "https://www.jornalminasgerais.mg.gov.br"
 SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "").strip()
 
-
 app = FastAPI(
     title="FUNED Diário Oficial Service",
-    version="2.2.0",
+    version="3.0.0",
 )
 
 
-class EdicaoRequest(BaseModel):
-    id_jornal: int = Field(..., gt=0)
+class MonitoramentoRequest(BaseModel):
     data_publicacao: date
     texto_pesquisa: str = "Fundação Ezequiel Dias"
 
 
-# ==========================================================
-# AUTENTICAÇÃO DA API DO SERVIÇO
-# ==========================================================
+class EdicaoRequest(MonitoramentoRequest):
+    id_jornal: int = Field(..., gt=0)
+
 
 def verificar_chave(valor: str | None) -> None:
     if SERVICE_API_KEY and valor != SERVICE_API_KEY:
@@ -47,10 +48,6 @@ def verificar_chave(valor: str | None) -> None:
             detail="Chave da API do serviço inválida.",
         )
 
-
-# ==========================================================
-# LOCALIZAÇÃO DO TOKEN DO PORTAL
-# ==========================================================
 
 def localizar_token_em_valor(valor: Any) -> str | None:
     if isinstance(valor, str):
@@ -63,44 +60,33 @@ def localizar_token_em_valor(valor: Any) -> str | None:
             return f"Bearer {texto}"
 
         try:
-            convertido = json.loads(texto)
-            return localizar_token_em_valor(convertido)
+            return localizar_token_em_valor(json.loads(texto))
         except Exception:
             return None
 
     if isinstance(valor, dict):
         for item in valor.values():
             token = localizar_token_em_valor(item)
-
             if token:
                 return token
 
     if isinstance(valor, list):
         for item in valor:
             token = localizar_token_em_valor(item)
-
             if token:
                 return token
 
     return None
 
 
-# ==========================================================
-# TRATAMENTO DE TEXTO
-# ==========================================================
-
 def normalizar_texto(valor: str) -> str:
     texto = unicodedata.normalize("NFD", valor)
-
     texto = "".join(
         caractere
         for caractere in texto
         if unicodedata.category(caractere) != "Mn"
     )
-
-    texto = texto.lower()
-
-    return re.sub(r"\s+", " ", texto).strip()
+    return re.sub(r"\s+", " ", texto.lower()).strip()
 
 
 def limpar_texto_pagina(texto: str) -> str:
@@ -108,33 +94,15 @@ def limpar_texto_pagina(texto: str) -> str:
     texto = re.sub(r"[ \t]+", " ", texto)
     texto = re.sub(r"\n[ \t]+", "\n", texto)
     texto = re.sub(r"\n{3,}", "\n\n", texto)
-
     return texto.strip()
 
 
-# ==========================================================
-# EXTRAÇÃO E VALIDAÇÃO DO PDF
-# ==========================================================
-
-def possui_assinatura_pdf(conteudo: bytes) -> bool:
-    return b"%PDF-" in conteudo
-
-
 def extrair_pdf_embutido(conteudo: bytes) -> bytes | None:
-    """
-    Localiza um PDF verdadeiro dentro do conteúdo recebido.
-
-    O portal pode devolver o PDF diretamente ou dentro de um
-    envelope binário, como CMS/PKCS#7.
-    """
-
     inicio_pdf = conteudo.find(b"%PDF-")
-
     if inicio_pdf < 0:
         return None
 
     fim_pdf = conteudo.rfind(b"%%EOF")
-
     if fim_pdf >= inicio_pdf:
         fim_pdf += len(b"%%EOF")
         return conteudo[inicio_pdf:fim_pdf]
@@ -153,102 +121,61 @@ def extrair_pdf_de_zip(conteudo: bytes) -> bytes | None:
                 for nome in arquivo_zip.namelist()
                 if nome.lower().endswith(".pdf")
             ]
-
             if not arquivos_pdf:
                 return None
-
             return arquivo_zip.read(arquivos_pdf[0])
-
     except Exception:
         return None
 
 
 def validar_bytes_pdf(conteudo: bytes) -> bytes:
     pdf_embutido = extrair_pdf_embutido(conteudo)
-
-    if pdf_embutido and possui_assinatura_pdf(pdf_embutido):
+    if pdf_embutido:
         return pdf_embutido
 
     pdf_zip = extrair_pdf_de_zip(conteudo)
-
     if pdf_zip:
         pdf_embutido_zip = extrair_pdf_embutido(pdf_zip)
-
-        if (
-            pdf_embutido_zip
-            and possui_assinatura_pdf(pdf_embutido_zip)
-        ):
+        if pdf_embutido_zip:
             return pdf_embutido_zip
-
-    inicio_hexadecimal = conteudo[:80].hex()
-
-    inicio_legivel = conteudo[:200].decode(
-        "utf-8",
-        errors="replace",
-    )
 
     raise HTTPException(
         status_code=502,
         detail={
-            "mensagem": (
-                "O conteúdo recebido não contém um PDF válido."
-            ),
+            "mensagem": "O conteúdo recebido não contém um PDF válido.",
             "tamanhoBytes": len(conteudo),
-            "inicioHexadecimal": inicio_hexadecimal,
-            "inicioConteudo": inicio_legivel,
+            "inicioHexadecimal": conteudo[:80].hex(),
         },
     )
 
 
 def tentar_decodificar_base64(valor: str) -> bytes | None:
-    texto = valor.strip()
-
     texto = re.sub(
         r"^data:application/pdf;base64,",
         "",
-        texto,
+        valor.strip(),
         flags=re.IGNORECASE,
     )
-
     texto = re.sub(r"\s+", "", texto)
 
     if len(texto) < 100:
         return None
 
-    tentativas = [texto]
-
     restante = len(texto) % 4
-
     if restante:
-        tentativas.append(
-            texto + ("=" * (4 - restante))
-        )
+        texto += "=" * (4 - restante)
 
-    for candidato in tentativas:
-        try:
-            conteudo = base64.b64decode(
-                candidato,
-                validate=True,
-            )
+    try:
+        return base64.b64decode(texto, validate=True)
+    except (binascii.Error, ValueError):
+        return None
 
-            if conteudo:
-                return conteudo
-
-        except (binascii.Error, ValueError):
-            continue
-
-    return None
-
-
-# ==========================================================
-# BUSCA DE ARQUIVO OU URL NO JSON DO PORTAL
-# ==========================================================
 
 def coletar_candidatos_arquivo(
     valor: Any,
     caminho: str = "resposta",
-) -> list[dict[str, Any]]:
-    candidatos: list[dict[str, Any]] = []
+) -> list[dict[str, str]]:
+    candidatos: list[dict[str, str]] = []
 
     chaves_relevantes = {
         "arquivo",
@@ -278,17 +205,11 @@ def coletar_candidatos_arquivo(
                 and item.strip()
             ):
                 candidatos.append(
-                    {
-                        "caminho": novo_caminho,
-                        "valor": item.strip(),
-                    }
+                    {"caminho": novo_caminho, "valor": item.strip()}
                 )
 
             candidatos.extend(
-                coletar_candidatos_arquivo(
-                    item,
-                    novo_caminho,
-                )
+                coletar_candidatos_arquivo(item, novo_caminho)
             )
 
     elif isinstance(valor, list):
@@ -305,7 +226,6 @@ def coletar_candidatos_arquivo(
 
 def parece_url(valor: str) -> bool:
     texto = valor.strip().lower()
-
     return (
         texto.startswith("http://")
         or texto.startswith("https://")
@@ -313,10 +233,6 @@ def parece_url(valor: str) -> bool:
         or texto.startswith("api/")
     )
 
-
-# ==========================================================
-# DOWNLOAD DO ARQUIVO
-# ==========================================================
 
 async def baixar_arquivo(
     requisicoes: APIRequestContext,
@@ -329,50 +245,34 @@ async def baixar_arquivo(
         url_absoluta,
         headers={
             "Authorization": bearer_token,
-            "Accept": (
-                "application/pdf,"
-                "application/octet-stream,"
-                "application/zip,"
-                "*/*"
-            ),
+            "Accept": "application/pdf,application/octet-stream,application/zip,*/*",
         },
         timeout=120_000,
         fail_on_status_code=False,
     )
 
-    content_type = resposta.headers.get(
-        "content-type",
-        "",
-    )
-
     if not resposta.ok:
-        texto_erro = await resposta.text()
-
         raise HTTPException(
             status_code=502,
             detail={
                 "mensagem": "O download do arquivo foi recusado.",
                 "url": url_absoluta,
                 "status": resposta.status,
-                "contentType": content_type,
-                "resposta": texto_erro[:500],
+                "resposta": (await resposta.text())[:500],
             },
         )
 
     conteudo = await resposta.body()
-
     pdf_bytes = validar_bytes_pdf(conteudo)
 
-    diagnostico = {
+    return pdf_bytes, {
         "origem": "url",
         "url": url_absoluta,
         "status": resposta.status,
-        "contentType": content_type,
+        "contentType": resposta.headers.get("content-type", ""),
         "tamanhoRecebidoBytes": len(conteudo),
         "tamanhoPdfExtraidoBytes": len(pdf_bytes),
     }
-
-    return pdf_bytes, diagnostico
 
 
 async def localizar_e_obter_pdf(
@@ -380,144 +280,81 @@ async def localizar_e_obter_pdf(
     requisicoes: APIRequestContext,
     bearer_token: str,
 ) -> tuple[bytes, dict[str, Any]]:
-    candidatos = coletar_candidatos_arquivo(
-        resposta_json
-    )
+    candidatos = coletar_candidatos_arquivo(resposta_json)
 
     if not candidatos:
         raise HTTPException(
             status_code=502,
-            detail={
-                "mensagem": (
-                    "Nenhum campo candidato a PDF ou URL foi "
-                    "localizado na resposta do portal."
-                ),
-                "chavesResposta": list(
-                    resposta_json.keys()
-                ),
-            },
+            detail="Nenhum campo candidato a PDF foi localizado.",
         )
 
-    erros_candidatos: list[dict[str, Any]] = []
-
-    candidatos_ordenados = sorted(
+    candidatos = sorted(
         candidatos,
-        key=lambda item: (
-            0 if parece_url(item["valor"]) else 1
-        ),
+        key=lambda item: 0 if parece_url(item["valor"]) else 1,
     )
 
-    for candidato in candidatos_ordenados:
+    erros: list[dict[str, Any]] = []
+
+    for candidato in candidatos:
         caminho = candidato["caminho"]
         valor = candidato["valor"]
 
         try:
             if parece_url(valor):
                 pdf_bytes, diagnostico = await baixar_arquivo(
-                    requisicoes=requisicoes,
-                    url=valor,
-                    bearer_token=bearer_token,
+                    requisicoes,
+                    valor,
+                    bearer_token,
                 )
-
                 diagnostico["campoOrigem"] = caminho
-
                 return pdf_bytes, diagnostico
 
-            bytes_decodificados = tentar_decodificar_base64(
-                valor
-            )
-
-            if bytes_decodificados:
-                pdf_bytes = validar_bytes_pdf(
-                    bytes_decodificados
-                )
-
+            decodificado = tentar_decodificar_base64(valor)
+            if decodificado:
+                pdf_bytes = validar_bytes_pdf(decodificado)
                 return pdf_bytes, {
                     "origem": "base64",
                     "campoOrigem": caminho,
-                    "tamanhoRecebidoBytes": len(
-                        bytes_decodificados
-                    ),
-                    "tamanhoPdfExtraidoBytes": len(
-                        pdf_bytes
-                    ),
+                    "tamanhoRecebidoBytes": len(decodificado),
+                    "tamanhoPdfExtraidoBytes": len(pdf_bytes),
                 }
-
-        except HTTPException as erro:
-            erros_candidatos.append(
-                {
-                    "campo": caminho,
-                    "erro": erro.detail,
-                }
-            )
 
         except Exception as erro:
-            erros_candidatos.append(
+            erros.append(
                 {
                     "campo": caminho,
                     "erro": str(erro),
-                    "tipo": type(erro).__name__,
                 }
             )
 
     raise HTTPException(
         status_code=502,
         detail={
-            "mensagem": (
-                "Foram encontrados campos candidatos, mas nenhum "
-                "deles resultou em um PDF válido."
-            ),
-            "totalCandidatos": len(candidatos),
-            "tentativas": erros_candidatos[:10],
+            "mensagem": "Nenhum candidato resultou em PDF válido.",
+            "tentativas": erros[:10],
         },
     )
 
-
-# ==========================================================
-# EXTRAÇÃO DO TEXTO DAS PÁGINAS
-# ==========================================================
 
 def extrair_publicacoes_pdf(
     pdf_bytes: bytes,
     termos: list[str],
 ) -> dict[str, Any]:
     try:
-        leitor = PdfReader(
-            BytesIO(pdf_bytes),
-            strict=False,
-        )
-
+        leitor = PdfReader(BytesIO(pdf_bytes), strict=False)
     except Exception as erro:
         raise HTTPException(
             status_code=502,
-            detail={
-                "mensagem": (
-                    "O PDF foi extraído, mas não pôde ser "
-                    "aberto pelo pypdf."
-                ),
-                "erro": str(erro),
-                "tipo": type(erro).__name__,
-                "tamanhoBytes": len(pdf_bytes),
-                "inicioArquivo": (
-                    pdf_bytes[:20].decode(
-                        "latin-1",
-                        errors="replace",
-                    )
-                ),
-            },
+            detail=f"O PDF não pôde ser aberto: {erro}",
         ) from erro
 
-    termos_unicos: list[str] = []
-
-    for termo in termos:
-        termo_limpo = termo.strip()
-
-        if (
-            termo_limpo
-            and termo_limpo not in termos_unicos
-        ):
-            termos_unicos.append(termo_limpo)
-
+    termos_unicos = list(
+        dict.fromkeys(
+            termo.strip()
+            for termo in termos
+            if termo and termo.strip()
+        )
+    )
     termos_normalizados = [
         normalizar_texto(termo)
         for termo in termos_unicos
@@ -530,47 +367,30 @@ def extrair_publicacoes_pdf(
         numero_pagina = indice + 1
 
         try:
-            texto_extraido = pagina.extract_text() or ""
-
-        except Exception:
-            texto_extraido = ""
-
-        texto_extraido = limpar_texto_pagina(
-            texto_extraido
-        )
-
-        if not texto_extraido:
-            paginas_sem_texto.append(
-                numero_pagina
+            texto = limpar_texto_pagina(
+                pagina.extract_text() or ""
             )
+        except Exception:
+            texto = ""
+
+        if not texto:
+            paginas_sem_texto.append(numero_pagina)
             continue
 
-        texto_normalizado = normalizar_texto(
-            texto_extraido
-        )
-
+        texto_normalizado = normalizar_texto(texto)
         termos_encontrados = [
             termo_original
             for termo_original, termo_normalizado
-            in zip(
-                termos_unicos,
-                termos_normalizados,
-            )
-            if (
-                termo_normalizado
-                and termo_normalizado
-                in texto_normalizado
-            )
+            in zip(termos_unicos, termos_normalizados)
+            if termo_normalizado in texto_normalizado
         ]
 
         if termos_encontrados:
             publicacoes.append(
                 {
                     "pagina": numero_pagina,
-                    "termosEncontrados": (
-                        termos_encontrados
-                    ),
-                    "textoPagina": texto_extraido,
+                    "termosEncontrados": termos_encontrados,
+                    "textoPagina": texto,
                 }
             )
 
@@ -582,22 +402,300 @@ def extrair_publicacoes_pdf(
         ],
         "totalPublicacoes": len(publicacoes),
         "publicacoes": publicacoes,
-        "paginasSemTextoExtraivel": (
-            paginas_sem_texto
-        ),
+        "paginasSemTextoExtraivel": paginas_sem_texto,
     }
 
 
-# ==========================================================
-# ROTAS
-# ==========================================================
+async def localizar_token(
+    pagina: Page,
+    contexto: BrowserContext,
+) -> str:
+    token_capturado: str | None = None
+
+    def capturar_token(requisicao) -> None:
+        nonlocal token_capturado
+        authorization = requisicao.headers.get("authorization")
+        if authorization and authorization.startswith("Bearer "):
+            token_capturado = authorization
+
+    pagina.on("request", capturar_token)
+
+    await pagina.goto(
+        PORTAL,
+        wait_until="domcontentloaded",
+        timeout=90_000,
+    )
+    await pagina.wait_for_timeout(3_000)
+
+    for _ in range(20):
+        if token_capturado:
+            return token_capturado
+        await pagina.wait_for_timeout(500)
+
+    armazenamentos = await pagina.evaluate(
+        """
+        () => {
+          const local = {};
+          const session = {};
+
+          for (let i = 0; i < localStorage.length; i++) {
+            const chave = localStorage.key(i);
+            local[chave] = localStorage.getItem(chave);
+          }
+
+          for (let i = 0; i < sessionStorage.length; i++) {
+            const chave = sessionStorage.key(i);
+            session[chave] = sessionStorage.getItem(chave);
+          }
+
+          return { local, session };
+        }
+        """
+    )
+
+    token_capturado = localizar_token_em_valor(armazenamentos)
+
+    if not token_capturado:
+        token_capturado = localizar_token_em_valor(
+            await contexto.cookies()
+        )
+
+    if not token_capturado:
+        raise HTTPException(
+            status_code=502,
+            detail="O portal foi aberto, mas nenhum Bearer Token foi localizado.",
+        )
+
+    return token_capturado
+
+
+async def pesquisar_id_jornal(
+    pagina: Page,
+    carga: MonitoramentoRequest,
+) -> tuple[int, dict[str, Any]]:
+    dados_pesquisa = {
+        "PaginaAtual": 1,
+        "TamanhoPagina": 20,
+        "textoPesquisa": carga.texto_pesquisa,
+        "dataPublicacaoInicial": carga.data_publicacao.isoformat(),
+        "dataPublicacaoFinal": carga.data_publicacao.isoformat(),
+        "DiarioExecutivo": True,
+        "Municipios": False,
+        "Terceiros": False,
+        "EdicaoExtra": False,
+    }
+
+    url_pesquisa = (
+        f"{PORTAL}/pesquisa?dadosPesquisa="
+        f"{quote(json.dumps(dados_pesquisa, ensure_ascii=False))}"
+    )
+
+    loop = asyncio.get_running_loop()
+    resposta_futura: asyncio.Future[dict[str, Any]] = (
+        loop.create_future()
+    )
+
+    async def processar_resposta(resposta) -> None:
+        if (
+            "PesquisarJornaisPaginados"
+            not in resposta.url
+            or resposta_futura.done()
+        ):
+            return
+
+        try:
+            resposta_futura.set_result(await resposta.json())
+        except Exception as erro:
+            resposta_futura.set_exception(erro)
+
+    def ao_receber_resposta(resposta) -> None:
+        asyncio.create_task(processar_resposta(resposta))
+
+    pagina.on("response", ao_receber_resposta)
+
+    try:
+        await pagina.goto(
+            url_pesquisa,
+            wait_until="domcontentloaded",
+            timeout=90_000,
+        )
+
+        resposta_json = await asyncio.wait_for(
+            resposta_futura,
+            timeout=60,
+        )
+    except asyncio.TimeoutError as erro:
+        raise HTTPException(
+            status_code=504,
+            detail="A pesquisa do portal não retornou a lista de edições.",
+        ) from erro
+    finally:
+        pagina.remove_listener("response", ao_receber_resposta)
+
+    resultados = resposta_json.get("dados", [])
+
+    if not isinstance(resultados, list) or not resultados:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Nenhuma edição com a expressão pesquisada foi "
+                "localizada na data informada."
+            ),
+        )
+
+    candidatos = [
+        item
+        for item in resultados
+        if isinstance(item, dict)
+        and "executivo" in str(
+            item.get("tipoCaderno", "")
+        ).lower()
+    ]
+
+    escolhido = candidatos[0] if candidatos else resultados[0]
+    id_jornal = escolhido.get("idJornal")
+
+    if not id_jornal:
+        raise HTTPException(
+            status_code=502,
+            detail="A pesquisa retornou resultado sem idJornal.",
+        )
+
+    return int(id_jornal), escolhido
+
+
+async def processar_edicao(
+    contexto: BrowserContext,
+    token: str,
+    id_jornal: int,
+    carga: MonitoramentoRequest,
+    resultado_pesquisa: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    url_edicao = (
+        f"{PORTAL}/api/v1/Jornal/"
+        f"ObterEdicaoPorId/{id_jornal}"
+    )
+
+    resposta = await contexto.request.get(
+        url_edicao,
+        headers={
+            "Authorization": token,
+            "Accept": "application/json",
+        },
+        timeout=120_000,
+        fail_on_status_code=False,
+    )
+
+    if not resposta.ok:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "mensagem": "O portal recusou a consulta da edição.",
+                "status": resposta.status,
+                "resposta": (await resposta.text())[:500],
+            },
+        )
+
+    resposta_json = await resposta.json()
+
+    pdf_bytes, diagnostico = await localizar_e_obter_pdf(
+        resposta_json,
+        contexto.request,
+        token,
+    )
+
+    resultado = extrair_publicacoes_pdf(
+        pdf_bytes,
+        [
+            carga.texto_pesquisa,
+            "Fundação Ezequiel Dias",
+            "FUNED",
+            "Funed",
+        ],
+    )
+
+    dados_originais = resposta_json.get("dados", {})
+    cadernos = (
+        dados_originais.get("cadernos", [])
+        if isinstance(dados_originais, dict)
+        else []
+    )
+
+    return {
+        "dados": {
+            "idJornal": id_jornal,
+            "dataPublicacao": carga.data_publicacao.isoformat(),
+            "textoPesquisa": carga.texto_pesquisa,
+            "resultadoPesquisa": resultado_pesquisa,
+            "cadernos": cadernos,
+            **resultado,
+            "diagnosticoArquivo": diagnostico,
+        },
+        "erros": [],
+    }
+
+
+async def executar_monitoramento(
+    carga: MonitoramentoRequest,
+    id_jornal: int | None = None,
+) -> dict[str, Any]:
+    async with async_playwright() as playwright:
+        navegador = await playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+
+        contexto = await navegador.new_context(
+            locale="pt-BR",
+            timezone_id="America/Sao_Paulo",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/130.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1440, "height": 1000},
+        )
+
+        pagina = await contexto.new_page()
+
+        try:
+            token = await localizar_token(pagina, contexto)
+            resultado_pesquisa = None
+
+            if id_jornal is None:
+                id_jornal, resultado_pesquisa = (
+                    await pesquisar_id_jornal(pagina, carga)
+                )
+
+            return await processar_edicao(
+                contexto,
+                token,
+                id_jornal,
+                carga,
+                resultado_pesquisa,
+            )
+
+        except PlaywrightTimeoutError as erro:
+            raise HTTPException(
+                status_code=504,
+                detail="O portal demorou demais para responder.",
+            ) from erro
+
+        finally:
+            await contexto.close()
+            await navegador.close()
+
 
 @app.get("/")
 async def raiz() -> dict[str, str]:
     return {
         "servico": "FUNED Diário Oficial",
         "status": "online",
-        "versao": "2.2.0",
+        "versao": "3.0.0",
     }
 
 
@@ -605,8 +703,17 @@ async def raiz() -> dict[str, str]:
 async def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "versao": "2.2.0",
+        "versao": "3.0.0",
     }
+
+
+@app.post("/monitoramento")
+async def monitoramento(
+    carga: MonitoramentoRequest,
+    x_api_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    verificar_chave(x_api_key)
+    return await executar_monitoramento(carga)
 
 
 @app.post("/edicao")
@@ -615,309 +722,7 @@ async def obter_edicao(
     x_api_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     verificar_chave(x_api_key)
-
-    token_capturado: str | None = None
-
-    async with async_playwright() as playwright:
-        navegador = await playwright.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                (
-                    "--disable-blink-features="
-                    "AutomationControlled"
-                ),
-            ],
-        )
-
-        contexto = await navegador.new_context(
-            locale="pt-BR",
-            timezone_id="America/Sao_Paulo",
-            user_agent=(
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/130.0.0.0 Safari/537.36"
-            ),
-            viewport={
-                "width": 1440,
-                "height": 1000,
-            },
-        )
-
-        pagina = await contexto.new_page()
-
-        def capturar_token(requisicao) -> None:
-            nonlocal token_capturado
-
-            authorization = requisicao.headers.get(
-                "authorization"
-            )
-
-            if (
-                authorization
-                and authorization.startswith(
-                    "Bearer "
-                )
-            ):
-                token_capturado = authorization
-
-        pagina.on("request", capturar_token)
-
-        dados_pesquisa = {
-            "PaginaAtual": 1,
-            "TamanhoPagina": 20,
-            "textoPesquisa": carga.texto_pesquisa,
-            "dataPublicacaoInicial": (
-                carga.data_publicacao.isoformat()
-            ),
-            "dataPublicacaoFinal": (
-                carga.data_publicacao.isoformat()
-            ),
-            "DiarioExecutivo": True,
-            "Municipios": False,
-            "Terceiros": False,
-            "EdicaoExtra": False,
-        }
-
-        dados_pesquisa_json = json.dumps(
-            dados_pesquisa,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-
-        url_pesquisa = (
-            f"{PORTAL}/pesquisa?dadosPesquisa="
-            f"{quote(dados_pesquisa_json)}"
-        )
-
-        try:
-            await pagina.goto(
-                PORTAL,
-                wait_until="domcontentloaded",
-                timeout=90_000,
-            )
-
-            await pagina.wait_for_timeout(3_000)
-
-            await pagina.goto(
-                url_pesquisa,
-                wait_until="domcontentloaded",
-                timeout=90_000,
-            )
-
-            await pagina.wait_for_timeout(8_000)
-
-            for _ in range(60):
-                if token_capturado:
-                    break
-
-                await pagina.wait_for_timeout(500)
-
-            if not token_capturado:
-                armazenamentos = await pagina.evaluate(
-                    """
-                    () => {
-                      const local = {};
-                      const session = {};
-
-                      for (
-                        let i = 0;
-                        i < localStorage.length;
-                        i++
-                      ) {
-                        const chave = localStorage.key(i);
-
-                        local[chave] =
-                          localStorage.getItem(chave);
-                      }
-
-                      for (
-                        let i = 0;
-                        i < sessionStorage.length;
-                        i++
-                      ) {
-                        const chave = sessionStorage.key(i);
-
-                        session[chave] =
-                          sessionStorage.getItem(chave);
-                      }
-
-                      return {
-                        local,
-                        session
-                      };
-                    }
-                    """
-                )
-
-                token_capturado = localizar_token_em_valor(
-                    armazenamentos
-                )
-
-            if not token_capturado:
-                cookies = await contexto.cookies()
-
-                token_capturado = localizar_token_em_valor(
-                    cookies
-                )
-
-            if not token_capturado:
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        "O portal foi aberto, mas nenhum "
-                        "Bearer Token foi localizado."
-                    ),
-                )
-
-            url_edicao = (
-                f"{PORTAL}/api/v1/Jornal/"
-                f"ObterEdicaoPorId/"
-                f"{carga.id_jornal}"
-            )
-
-            resposta_portal = await contexto.request.get(
-                url_edicao,
-                headers={
-                    "Authorization": token_capturado,
-                    "Accept": "application/json",
-                },
-                timeout=120_000,
-                fail_on_status_code=False,
-            )
-
-            if not resposta_portal.ok:
-                texto_erro = await resposta_portal.text()
-
-                raise HTTPException(
-                    status_code=502,
-                    detail={
-                        "mensagem": (
-                            "O portal recusou a consulta "
-                            "da edição."
-                        ),
-                        "status": resposta_portal.status,
-                        "resposta": texto_erro[:500],
-                    },
-                )
-
-            try:
-                resposta_json = await resposta_portal.json()
-
-            except Exception as erro:
-                texto_resposta = await resposta_portal.text()
-
-                raise HTTPException(
-                    status_code=502,
-                    detail={
-                        "mensagem": (
-                            "O portal não retornou um JSON válido."
-                        ),
-                        "resposta": texto_resposta[:500],
-                    },
-                ) from erro
-
-            pdf_bytes, diagnostico_arquivo = (
-                await localizar_e_obter_pdf(
-                    resposta_json=resposta_json,
-                    requisicoes=contexto.request,
-                    bearer_token=token_capturado,
-                )
-            )
-
-            termos_busca = [
-                carga.texto_pesquisa,
-                "Fundação Ezequiel Dias",
-                "FUNED",
-                "Funed",
-            ]
-
-            resultado_extracao = extrair_publicacoes_pdf(
-                pdf_bytes=pdf_bytes,
-                termos=termos_busca,
-            )
-
-            dados_originais = resposta_json.get(
-                "dados",
-                {},
-            )
-
-            cadernos = []
-
-            if isinstance(dados_originais, dict):
-                cadernos = dados_originais.get(
-                    "cadernos",
-                    [],
-                )
-
-            return {
-                "dados": {
-                    "idJornal": carga.id_jornal,
-                    "dataPublicacao": (
-                        carga.data_publicacao.isoformat()
-                    ),
-                    "textoPesquisa": (
-                        carga.texto_pesquisa
-                    ),
-                    "cadernos": cadernos,
-                    "totalPaginas": (
-                        resultado_extracao[
-                            "totalPaginas"
-                        ]
-                    ),
-                    "paginasLocalizadas": (
-                        resultado_extracao[
-                            "paginasLocalizadas"
-                        ]
-                    ),
-                    "totalPublicacoes": (
-                        resultado_extracao[
-                            "totalPublicacoes"
-                        ]
-                    ),
-                    "publicacoes": (
-                        resultado_extracao[
-                            "publicacoes"
-                        ]
-                    ),
-                    "paginasSemTextoExtraivel": (
-                        resultado_extracao[
-                            "paginasSemTextoExtraivel"
-                        ]
-                    ),
-                    "diagnosticoArquivo": (
-                        diagnostico_arquivo
-                    ),
-                },
-                "erros": [],
-            }
-
-        except PlaywrightTimeoutError as erro:
-            raise HTTPException(
-                status_code=504,
-                detail=(
-                    "O portal demorou demais para responder."
-                ),
-            ) from erro
-
-        except HTTPException:
-            raise
-
-        except Exception as erro:
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "mensagem": (
-                        "Falha inesperada ao processar a edição."
-                    ),
-                    "erro": str(erro),
-                    "tipo": type(erro).__name__,
-                },
-            ) from erro
-
-        finally:
-            await contexto.close()
-            await navegador.close()
+    return await executar_monitoramento(
+        carga,
+        id_jornal=carga.id_jornal,
+    )
