@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import quote, urljoin
 
 from fastapi import FastAPI, Header, HTTPException
+from starlette.concurrency import run_in_threadpool
 from playwright.async_api import (
     APIRequestContext,
     BrowserContext,
@@ -267,7 +268,7 @@ async def baixar_arquivo(
         )
 
     conteudo = await resposta.body()
-    pdf_bytes = validar_bytes_pdf(conteudo)
+    pdf_bytes = await run_in_threadpool(validar_bytes_pdf, conteudo)
 
     return pdf_bytes, {
         "origem": "url",
@@ -315,7 +316,7 @@ async def localizar_e_obter_pdf(
 
             decodificado = tentar_decodificar_base64(valor)
             if decodificado:
-                pdf_bytes = validar_bytes_pdf(decodificado)
+                pdf_bytes = await run_in_threadpool(validar_bytes_pdf, decodificado)
                 return pdf_bytes, {
                     "origem": "base64",
                     "campoOrigem": caminho,
@@ -848,7 +849,8 @@ async def processar_edicao(
         token,
     )
 
-    resultado = extrair_publicacoes_pdf(
+    resultado = await run_in_threadpool(
+        extrair_publicacoes_pdf,
         pdf_bytes,
         [
             carga.texto_pesquisa,
