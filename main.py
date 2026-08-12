@@ -69,8 +69,36 @@ ESPERA_ENTRE_TENTATIVAS_MS = 5000
 # 1. Buscar as páginas do Diário no serviço Render (Python + Playwright)
 # --------------------------------------------------------------------------
 
+# Tempo máximo esperando o serviço free do Render "acordar" (instância dorme
+# após 15 min sem tráfego; o Render avisa que pode levar 50s ou mais).
+ACORDAR_TIMEOUT_S = 120
+ACORDAR_INTERVALO_S = 5
+
+
+def aguardar_servico_acordar():
+    """Faz ping em /health até o serviço responder, ou desiste após ACORDAR_TIMEOUT_S."""
+    url = f"{RENDER_BASE_URL}/health"
+    inicio = time.monotonic()
+    tentativa = 0
+    while time.monotonic() - inicio < ACORDAR_TIMEOUT_S:
+        tentativa += 1
+        try:
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200:
+                print(f"Serviço acordado (tentativa {tentativa}, {time.monotonic() - inicio:.0f}s).")
+                return True
+        except Exception as e:  # noqa: BLE001
+            print(f"[wake-up tentativa {tentativa}] ainda não respondeu: {e}", file=sys.stderr)
+        time.sleep(ACORDAR_INTERVALO_S)
+
+    print("Serviço não confirmou estar acordado a tempo; seguindo mesmo assim.", file=sys.stderr)
+    return False
+
+
 def buscar_paginas_diario():
     """Chama POST /monitoramento no serviço funed-diario-service (Render)."""
+    aguardar_servico_acordar()
+
     url = f"{RENDER_BASE_URL}/monitoramento"
     payload = {
         "data_publicacao": DATA_HOJE_ISO,
@@ -81,8 +109,7 @@ def buscar_paginas_diario():
     ultimo_erro = None
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
-            # timeout alto: o serviço free do Render pode estar "dormindo" e
-            # o primeiro request acorda a instância (pode levar ~1 minuto).
+            # timeout alto: mesmo acordado, o scraping com Playwright pode demorar.
             resp = requests.post(url, json=payload, headers=headers, timeout=180)
             resp.raise_for_status()
             corpo = resp.json()
@@ -101,7 +128,9 @@ def buscar_paginas_diario():
             ultimo_erro = e
             print(f"[tentativa {tentativa}] erro ao chamar Render: {e}", file=sys.stderr)
             if tentativa < MAX_TENTATIVAS:
-                time.sleep(ESPERA_ENTRE_TENTATIVAS_MS / 1000)
+                # espera mais a cada tentativa (15s, 30s, 45s...) — dá mais
+                # tempo pra instância terminar de acordar entre as tentativas.
+                time.sleep((ESPERA_ENTRE_TENTATIVAS_MS / 1000) * tentativa * 3)
 
     raise RuntimeError(f"Falha ao buscar páginas do Diário após {MAX_TENTATIVAS} tentativas: {ultimo_erro}")
 
