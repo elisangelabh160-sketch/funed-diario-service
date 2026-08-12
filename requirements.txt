@@ -1,1 +1,6 @@
+fastapi
+uvicorn[standard]
+playwright
+pypdf
+pydantic
 requests
