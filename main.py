@@ -52,7 +52,7 @@ DESTINATARIOS = [e.strip() for e in os.environ["DESTINATARIOS"].split(",") if e.
 
 # Modelo gratuito do OpenRouter (sem custo, $0/token). Se este deixar de existir,
 # veja outros modelos ":free" em https://openrouter.ai/models?max_price=0
-MODELO_LLM = "meta-llama/llama-3.3-70b-instruct:free"
+MODELO_LLM = "nvidia/nemotron-3.5-lightning:free"
 
 # Texto de busca: mesmo padrão default do serviço. Pode sobrescrever com a env
 # var TEXTO_PESQUISA se preferir usar "Funed" como no fluxo n8n antigo.
