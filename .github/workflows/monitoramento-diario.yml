@@ -1,0 +1,33 @@
+name: Monitoramento Diário Oficial FUNED
+
+on:
+  schedule:
+    # 11:00 UTC = 08:00 horário de Brasília (BRT, UTC-3), de segunda a sexta.
+    # Ajuste o horário aqui se precisar (lembre-se: o valor é sempre em UTC).
+    - cron: "0 11 * * 1-5"
+  workflow_dispatch: {}  # permite rodar manualmente pela aba "Actions" no GitHub
+
+jobs:
+  monitorar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: pip install requests
+
+      - name: Rodar monitoramento e enviar e-mail
+        env:
+          RENDER_BASE_URL: ${{ secrets.RENDER_BASE_URL }}
+          SERVICE_API_KEY: ${{ secrets.SERVICE_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          DESTINATARIOS: ${{ secrets.DESTINATARIOS }}
+        run: python main.py
