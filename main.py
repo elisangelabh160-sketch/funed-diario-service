@@ -52,7 +52,14 @@ DESTINATARIOS = [e.strip() for e in os.environ["DESTINATARIOS"].split(",") if e.
 
 # Modelo gratuito do OpenRouter (sem custo, $0/token). Se este deixar de existir,
 # veja outros modelos ":free" em https://openrouter.ai/models?max_price=0
-MODELO_LLM = "nvidia/nemotron-3.5-lightning:free"
+#
+# Trocado de "nvidia/nemotron-3.5-lightning:free" pra este porque aquele é um
+# modelo de "raciocínio" que insiste em escrever um textão de pensamento em
+# voz alta (tipo "Here's a thinking process...") junto da resposta, estourando
+# o limite de tokens antes de chegar no JSON de verdade. Este aqui é um
+# modelo de chat/instrução direta (sem essa etapa de raciocínio longo) com
+# contexto grande, o que deve dar resultado bem mais consistente.
+MODELO_LLM = "poolside/laguna-s-2.1:free"
 
 # Texto de busca: mesmo padrão default do serviço. Pode sobrescrever com a env
 # var TEXTO_PESQUISA se preferir usar "Funed" como no fluxo n8n antigo.
@@ -183,35 +190,13 @@ def montar_prompt_usuario(paginas):
     return "\n\n".join(blocos)
 
 
-def _extrair_json(texto_resposta):
-    """Extrai o primeiro objeto JSON completo da resposta do modelo.
-
-    Modelos gratuitos às vezes:
-      - envolvem o JSON em ```json ... ```;
-      - escrevem algum comentário antes ou depois do JSON, mesmo quando
-        instruídos a não fazer isso.
-
-    Por isso não basta pegar da primeira "{" até a última "}" da resposta
-    inteira (isso quebra se houver qualquer chave sobrando no texto extra).
-    Em vez disso, a partir da primeira "{", contamos a profundidade de
-    chaves (respeitando strings/escapes) até ela voltar a zero — esse é o
-    fim real do primeiro objeto JSON, e qualquer coisa depois é ignorada.
-    """
-    texto = texto_resposta.strip()
-
-    # remove bloco de código markdown (```json ... ``` ou ``` ... ```), se houver
-    texto = re.sub(r"^```(?:json)?\s*", "", texto)
-    texto = re.sub(r"\s*```\s*$", "", texto)
-    texto = texto.strip()
-
-    inicio = texto.find("{")
-    if inicio == -1:
-        raise ValueError(f"Resposta do modelo não contém JSON reconhecível: {texto[:300]}")
-
+def _fim_do_objeto(texto, inicio):
+    """A partir de um índice onde texto[inicio] == '{', devolve o índice do
+    '}' que fecha esse mesmo objeto (respeitando strings/escapes), ou None
+    se as chaves nunca fecharem."""
     profundidade = 0
     dentro_de_string = False
     escapando = False
-    fim = None
     for i in range(inicio, len(texto)):
         ch = texto[i]
         if dentro_de_string:
@@ -229,14 +214,65 @@ def _extrair_json(texto_resposta):
         elif ch == "}":
             profundidade -= 1
             if profundidade == 0:
-                fim = i
-                break
+                return i
+    return None
 
-    if fim is None:
-        raise ValueError(f"JSON do modelo parece incompleto (chaves não fecham): {texto[:300]}")
 
-    bloco = texto[inicio:fim + 1]
-    return json.loads(bloco)
+def _extrair_json(texto_resposta):
+    """Extrai o objeto JSON da resposta do modelo.
+
+    Modelos gratuitos às vezes:
+      - envolvem o JSON em ```json ... ```;
+      - escrevem todo um "raciocínio" em texto livre antes da resposta, e
+        esse texto pode conter chaves { } soltas (ex: um placeholder tipo
+        "{lista de nomes}") que não são JSON de verdade;
+      - cortam a resposta no meio por falta de espaço, antes de chegar no
+        JSON de verdade.
+
+    Por isso: em vez de simplesmente pegar da primeira "{" até a última "}",
+    encontramos TODOS os blocos com chaves balanceadas no texto e escolhemos
+    o primeiro que (a) é JSON válido e (b) tem a cara do formato pedido
+    (contém "publicacoes" ou "paginas_com_atos"). Isso evita cair em algum
+    "{" solto que apareça no meio do raciocínio do modelo.
+    """
+    texto = texto_resposta.strip()
+
+    # remove bloco de código markdown (```json ... ``` ou ``` ... ```), se houver
+    texto = re.sub(r"^```(?:json)?\s*", "", texto)
+    texto = re.sub(r"\s*```\s*$", "", texto)
+    texto = texto.strip()
+
+    candidatos = []
+    i = 0
+    while i < len(texto):
+        if texto[i] == "{":
+            fim = _fim_do_objeto(texto, i)
+            if fim is not None:
+                candidatos.append(texto[i:fim + 1])
+                i = fim + 1
+                continue
+        i += 1
+
+    if not candidatos:
+        raise ValueError(f"Resposta do modelo não contém JSON reconhecível: {texto[:300]}")
+
+    primeiro_valido = None
+    for bloco in candidatos:
+        try:
+            obj = json.loads(bloco)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if "publicacoes" in obj or "paginas_com_atos" in obj:
+            return obj
+        if primeiro_valido is None:
+            primeiro_valido = obj
+
+    if primeiro_valido is not None:
+        return primeiro_valido
+
+    raise ValueError(f"Nenhum bloco JSON válido (com o formato esperado) na resposta do modelo: {texto[:300]}")
 
 
 def extrair_publicacoes(paginas):
@@ -252,10 +288,10 @@ def extrair_publicacoes(paginas):
         "temperature": 0.1,
         "max_tokens": 10000,
         "response_format": {"type": "json_object"},
-        # Esse modelo às vezes escreve o "raciocínio" dele junto com a resposta
-        # (texto tipo "Here's a thinking process..." antes do JSON). Isso pede
-        # pra ele não incluir esse raciocínio na resposta.
-        "reasoning": {"exclude": True},
+        # Caso o modelo escolhido tenha uma etapa de "raciocínio" opcional,
+        # isso pede pra ele não gastar tokens de resposta com isso. Modelos
+        # sem essa capacidade simplesmente ignoram esse parâmetro.
+        "reasoning": {"enabled": False},
     }
 
     ultimo_erro = None
@@ -268,10 +304,16 @@ def extrair_publicacoes(paginas):
                     "Content-Type": "application/json",
                 },
                 json=corpo,
-                timeout=120,
+                timeout=150,
             )
             resp.raise_for_status()
-            conteudo = resp.json()["choices"][0]["message"]["content"]
+            corpo_resposta = resp.json()
+            if "choices" not in corpo_resposta:
+                # A OpenRouter respondeu 200 OK mas sem o formato esperado
+                # (ex: bloqueio de conteúdo, erro do provedor). Mostra o
+                # corpo inteiro no log pra dar pra entender o motivo.
+                raise ValueError(f"resposta da OpenRouter sem 'choices': {json.dumps(corpo_resposta)[:1000]}")
+            conteudo = corpo_resposta["choices"][0]["message"]["content"]
             try:
                 return _extrair_json(conteudo)
             except Exception as erro_parse:  # noqa: BLE001
