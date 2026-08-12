@@ -180,12 +180,59 @@ def montar_prompt_usuario(paginas):
 
 
 def _extrair_json(texto_resposta):
-    """Modelos gratuitos às vezes envolvem o JSON em ```json ... ```; remove isso."""
+    """Extrai o primeiro objeto JSON completo da resposta do modelo.
+
+    Modelos gratuitos às vezes:
+      - envolvem o JSON em ```json ... ```;
+      - escrevem algum comentário antes ou depois do JSON, mesmo quando
+        instruídos a não fazer isso.
+
+    Por isso não basta pegar da primeira "{" até a última "}" da resposta
+    inteira (isso quebra se houver qualquer chave sobrando no texto extra).
+    Em vez disso, a partir da primeira "{", contamos a profundidade de
+    chaves (respeitando strings/escapes) até ela voltar a zero — esse é o
+    fim real do primeiro objeto JSON, e qualquer coisa depois é ignorada.
+    """
     texto = texto_resposta.strip()
-    match = re.search(r"\{.*\}", texto, re.DOTALL)
-    if not match:
+
+    # remove bloco de código markdown (```json ... ``` ou ``` ... ```), se houver
+    texto = re.sub(r"^```(?:json)?\s*", "", texto)
+    texto = re.sub(r"\s*```\s*$", "", texto)
+    texto = texto.strip()
+
+    inicio = texto.find("{")
+    if inicio == -1:
         raise ValueError(f"Resposta do modelo não contém JSON reconhecível: {texto[:300]}")
-    return json.loads(match.group(0))
+
+    profundidade = 0
+    dentro_de_string = False
+    escapando = False
+    fim = None
+    for i in range(inicio, len(texto)):
+        ch = texto[i]
+        if dentro_de_string:
+            if escapando:
+                escapando = False
+            elif ch == "\\":
+                escapando = True
+            elif ch == '"':
+                dentro_de_string = False
+            continue
+        if ch == '"':
+            dentro_de_string = True
+        elif ch == "{":
+            profundidade += 1
+        elif ch == "}":
+            profundidade -= 1
+            if profundidade == 0:
+                fim = i
+                break
+
+    if fim is None:
+        raise ValueError(f"JSON do modelo parece incompleto (chaves não fecham): {texto[:300]}")
+
+    bloco = texto[inicio:fim + 1]
+    return json.loads(bloco)
 
 
 def extrair_publicacoes(paginas):
@@ -217,7 +264,17 @@ def extrair_publicacoes(paginas):
             )
             resp.raise_for_status()
             conteudo = resp.json()["choices"][0]["message"]["content"]
-            return _extrair_json(conteudo)
+            try:
+                return _extrair_json(conteudo)
+            except Exception as erro_parse:  # noqa: BLE001
+                # Mostra a resposta bruta do modelo no log, pra dar pra ver
+                # exatamente o que veio quando o parse falha.
+                print(
+                    f"[tentativa {tentativa}] resposta bruta do modelo "
+                    f"(não foi possível extrair JSON): {conteudo[:2000]!r}",
+                    file=sys.stderr,
+                )
+                raise erro_parse
         except Exception as e:  # noqa: BLE001
             ultimo_erro = e
             print(f"[tentativa {tentativa}] erro ao chamar OpenRouter: {e}", file=sys.stderr)
