@@ -139,10 +139,14 @@ def buscar_paginas_diario():
 # 2. Extrair/estruturar as publicações com um modelo gratuito do OpenRouter
 # --------------------------------------------------------------------------
 
-PROMPT_SISTEMA = """Você é um assistente que analisa o Diário Oficial de Minas Gerais (Diário do \
+PROMPT_SISTEMA = """detailed thinking off
+
+Você é um assistente que analisa o Diário Oficial de Minas Gerais (Diário do \
 Executivo) em busca de publicações relacionadas à Fundação Ezequiel Dias (FUNED). \
 Você recebe o texto de várias páginas do Diário e deve devolver APENAS um JSON \
-válido (sem markdown, sem texto fora do JSON), no seguinte formato exato:
+válido (sem markdown, sem texto fora do JSON, sem explicar seu raciocínio, sem \
+escrever "thinking process" ou qualquer texto antes/depois do JSON), no seguinte \
+formato exato:
 
 {
   "paginas_com_atos": [8, 31, 33],
@@ -246,8 +250,12 @@ def extrair_publicacoes(paginas):
             {"role": "user", "content": montar_prompt_usuario(paginas)},
         ],
         "temperature": 0.1,
-        "max_tokens": 6000,
+        "max_tokens": 10000,
         "response_format": {"type": "json_object"},
+        # Esse modelo às vezes escreve o "raciocínio" dele junto com a resposta
+        # (texto tipo "Here's a thinking process..." antes do JSON). Isso pede
+        # pra ele não incluir esse raciocínio na resposta.
+        "reasoning": {"exclude": True},
     }
 
     ultimo_erro = None
