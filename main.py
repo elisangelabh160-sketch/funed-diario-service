@@ -195,6 +195,11 @@ Regras importantes:
   gastar espaço de resposta com dezenas de itens repetidos e ajuda a garantir espaço pra
   outros atos (como portarias completas) que também estejam na mesma página.
 - "conteudo_oficial" deve ser um recorte fiel do texto original da página (não invente, não resuma aqui).
+- IMPORTANTE: o campo "pessoas" de uma publicação deve conter SOMENTE pessoas que também
+  apareçam no texto de "conteudo_oficial" DESSA MESMA publicação. Nunca copie nomes de uma
+  tabela maior (ex: de outros órgãos, ou de antes de você filtrar quem é da FUNED) para
+  dentro de "pessoas" se esses nomes não estiverem no trecho de "conteudo_oficial" que você
+  realmente extraiu. As duas listas têm que bater.
 - "resumo_objetivo" é o único campo que deve estar em linguagem simplificada.
 - Se uma publicação citar múltiplas pessoas, liste todas em "pessoas".
 - Se não houver NENHUMA publicação relacionada à FUNED em nenhuma página, devolva:
