@@ -218,6 +218,58 @@ def _fim_do_objeto(texto, inicio):
     return None
 
 
+def _reparar_json_truncado(texto):
+    """Tenta salvar o que dá de uma resposta cortada no meio (o modelo parou
+    de escrever antes de fechar o JSON, geralmente por estourar o limite de
+    tokens da resposta).
+
+    Caminha pelo texto controlando quais chaves/colchetes estão abertos. Toda
+    vez que um "}" fecha um item e o nível logo acima é uma lista (ex: acabou
+    de fechar um objeto dentro de "publicacoes": [...]), isso é um "ponto
+    seguro" pra cortar — o item anterior está completo. Guardamos o último
+    ponto seguro e, no final, cortamos o texto ali e fechamos à mão o que
+    ainda estava aberto (array/objeto), pra virar um JSON válido só com as
+    publicações que já tinham vindo por inteiro antes do corte.
+    """
+    pilha = []
+    dentro_de_string = False
+    escapando = False
+    ultimo_corte_seguro = None
+    pilha_no_corte = None
+    for i, ch in enumerate(texto):
+        if dentro_de_string:
+            if escapando:
+                escapando = False
+            elif ch == "\\":
+                escapando = True
+            elif ch == '"':
+                dentro_de_string = False
+            continue
+        if ch == '"':
+            dentro_de_string = True
+        elif ch in "{[":
+            pilha.append(ch)
+        elif ch in "}]":
+            if pilha:
+                pilha.pop()
+            if pilha and pilha[-1] == "[":
+                ultimo_corte_seguro = i + 1
+                # guarda uma cópia da pilha NESSE momento — o que vier
+                # depois desse ponto no texto vai ser descartado, então as
+                # chaves que abrirem depois não contam pra fechar no final.
+                pilha_no_corte = list(pilha)
+
+    if ultimo_corte_seguro is None or not pilha_no_corte:
+        return None
+
+    fechamento = "".join("]" if c == "[" else "}" for c in reversed(pilha_no_corte))
+    candidato = texto[:ultimo_corte_seguro] + fechamento
+    try:
+        return json.loads(candidato)
+    except json.JSONDecodeError:
+        return None
+
+
 def _extrair_json(texto_resposta):
     """Extrai o objeto JSON da resposta do modelo.
 
@@ -231,9 +283,12 @@ def _extrair_json(texto_resposta):
 
     Por isso: em vez de simplesmente pegar da primeira "{" até a última "}",
     encontramos TODOS os blocos com chaves balanceadas no texto e escolhemos
-    o primeiro que (a) é JSON válido e (b) tem a cara do formato pedido
-    (contém "publicacoes" ou "paginas_com_atos"). Isso evita cair em algum
-    "{" solto que apareça no meio do raciocínio do modelo.
+    o que (a) é JSON válido, (b) tem a cara do formato pedido (contém
+    "publicacoes" ou "paginas_com_atos") e (c), se houver mais de um assim,
+    o que tiver mais publicações — pra não cair num rascunho vazio que o
+    modelo tenha escrito antes da resposta de verdade. Se nada disso achar
+    nada bom (ex: a resposta foi cortada no meio), tenta reparar o JSON
+    truncado pra pelo menos salvar as publicações que já vieram completas.
     """
     texto = texto_resposta.strip()
 
@@ -253,9 +308,7 @@ def _extrair_json(texto_resposta):
                 continue
         i += 1
 
-    if not candidatos:
-        raise ValueError(f"Resposta do modelo não contém JSON reconhecível: {texto[:300]}")
-
+    melhor = None
     primeiro_valido = None
     for bloco in candidatos:
         try:
@@ -264,14 +317,26 @@ def _extrair_json(texto_resposta):
             continue
         if not isinstance(obj, dict):
             continue
-        if "publicacoes" in obj or "paginas_com_atos" in obj:
-            return obj
         if primeiro_valido is None:
             primeiro_valido = obj
+        if "publicacoes" in obj or "paginas_com_atos" in obj:
+            if melhor is None or len(obj.get("publicacoes", [])) > len(melhor.get("publicacoes", [])):
+                melhor = obj
 
+    if melhor is not None and melhor.get("publicacoes"):
+        return melhor
+
+    reparado = _reparar_json_truncado(texto)
+    if reparado is not None and isinstance(reparado, dict) and reparado.get("publicacoes"):
+        return reparado
+
+    if melhor is not None:
+        return melhor
     if primeiro_valido is not None:
         return primeiro_valido
 
+    if not candidatos:
+        raise ValueError(f"Resposta do modelo não contém JSON reconhecível: {texto[:300]}")
     raise ValueError(f"Nenhum bloco JSON válido (com o formato esperado) na resposta do modelo: {texto[:300]}")
 
 
@@ -286,7 +351,10 @@ def extrair_publicacoes(paginas):
             {"role": "user", "content": montar_prompt_usuario(paginas)},
         ],
         "temperature": 0.1,
-        "max_tokens": 10000,
+        # Esse modelo aceita até 32768 tokens de resposta. Com várias páginas
+        # e várias pessoas por publicação, 10000 estava cortando a resposta
+        # no meio (por isso o e-mail saía "vazio" mesmo tendo publicações).
+        "max_tokens": 28000,
         "response_format": {"type": "json_object"},
         # Caso o modelo escolhido tenha uma etapa de "raciocínio" opcional,
         # isso pede pra ele não gastar tokens de resposta com isso. Modelos
@@ -304,7 +372,9 @@ def extrair_publicacoes(paginas):
                     "Content-Type": "application/json",
                 },
                 json=corpo,
-                timeout=150,
+                # com max_tokens bem maior, a resposta pode demorar mais pra
+                # ser gerada — dá mais tempo antes de desistir.
+                timeout=240,
             )
             resp.raise_for_status()
             corpo_resposta = resp.json()
@@ -314,6 +384,7 @@ def extrair_publicacoes(paginas):
                 # corpo inteiro no log pra dar pra entender o motivo.
                 raise ValueError(f"resposta da OpenRouter sem 'choices': {json.dumps(corpo_resposta)[:1000]}")
             conteudo = corpo_resposta["choices"][0]["message"]["content"]
+            print(f"[tentativa {tentativa}] resposta recebida ({len(conteudo)} caractere(s)).", file=sys.stderr)
             try:
                 resultado = _extrair_json(conteudo)
                 if not resultado.get("publicacoes"):
@@ -341,7 +412,11 @@ def extrair_publicacoes(paginas):
             ultimo_erro = e
             print(f"[tentativa {tentativa}] erro ao chamar OpenRouter: {e}", file=sys.stderr)
             if tentativa < MAX_TENTATIVAS:
-                time.sleep(ESPERA_ENTRE_TENTATIVAS_MS / 1000)
+                # "429 muitas requisições" precisa de mais tempo de espera do
+                # que os outros erros, senão a tentativa seguinte esbarra no
+                # mesmo limite de novo.
+                espera = 20 if "429" in str(e) else (ESPERA_ENTRE_TENTATIVAS_MS / 1000)
+                time.sleep(espera)
 
     raise RuntimeError(f"Falha ao extrair publicações via LLM após {MAX_TENTATIVAS} tentativas: {ultimo_erro}")
 
