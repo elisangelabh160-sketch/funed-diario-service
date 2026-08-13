@@ -33,6 +33,7 @@ import re
 import smtplib
 import sys
 import time
+import unicodedata
 from datetime import date
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -365,6 +366,79 @@ def _extrair_json(texto_resposta):
     raise ValueError(f"Nenhum bloco JSON válido (com o formato esperado) na resposta do modelo: {texto[:300]}")
 
 
+def _normalizar(texto):
+    """Remove acentos e baixa a caixa, pra comparação de texto ser tolerante a
+    pequenas diferenças de acentuação/maiúsculas entre 'pessoas' e 'conteudo_oficial'."""
+    if not texto:
+        return ""
+    sem_acento = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
+    return sem_acento.lower()
+
+
+def _pessoa_aparece_no_conteudo(pessoa, conteudo_normalizado, conteudo_digitos):
+    """Confere se a pessoa (por MASP ou por nome) realmente aparece no trecho de
+    'conteudo_oficial' dessa mesma publicação."""
+    masp_digitos = re.sub(r"\D", "", str(pessoa.get("masp") or ""))
+    if masp_digitos and masp_digitos in conteudo_digitos:
+        return True
+
+    nome = _normalizar(pessoa.get("nome") or "")
+    if not nome:
+        return False
+    if nome in conteudo_normalizado:
+        return True
+
+    # Às vezes o "conteudo_oficial" tem o nome com espaçamento/quebra de linha
+    # diferente do campo "pessoas". Aceita também se o PRIMEIRO nome e o
+    # ÚLTIMO sobrenome baterem os dois — reduz bastante falso positivo de
+    # nomes "roubados" de outra tabela/órgão, que dificilmente vão bater os
+    # dois pedaços por coincidência.
+    partes = nome.split()
+    if len(partes) >= 2:
+        primeiro_nome, sobrenome = partes[0], partes[-1]
+        if len(sobrenome) >= 4 and sobrenome in conteudo_normalizado and primeiro_nome in conteudo_normalizado:
+            return True
+
+    return False
+
+
+def _filtrar_pessoas_consistentes(dados):
+    """Pós-processamento (na unha, sem depender só da instrução no prompt) pra
+    corrigir um problema recorrente do modelo gratuito: o campo 'pessoas' de uma
+    publicação às vezes vem com dezenas de nomes copiados de uma tabela
+    maior/compartilhada entre vários órgãos, mesmo esses nomes não aparecendo no
+    trecho de 'conteudo_oficial' que o modelo realmente extraiu como sendo da
+    FUNED. Pedir isso só via prompt não foi suficiente em testes reais (o mesmo
+    problema se repetiu em rodadas seguidas mesmo com a instrução no prompt), então
+    aqui filtramos com certeza: só mantém em 'pessoas' quem realmente aparece (por
+    nome ou MASP) no 'conteudo_oficial' da mesma publicação."""
+    for pub in dados.get("publicacoes", []):
+        pessoas = pub.get("pessoas") or []
+        if not pessoas:
+            continue
+        conteudo_normalizado = _normalizar(pub.get("conteudo_oficial") or "")
+        if not conteudo_normalizado:
+            continue
+        conteudo_digitos = re.sub(r"\D", "", conteudo_normalizado)
+        pessoas_filtradas = [
+            p for p in pessoas if _pessoa_aparece_no_conteudo(p, conteudo_normalizado, conteudo_digitos)
+        ]
+        # Se o filtro zerasse TODAS as pessoas, é mais provável que o texto de
+        # "conteudo_oficial" esteja num formato inesperado do que todas as
+        # pessoas estarem erradas — nesse caso, mantém a lista original pra não
+        # perder informação real por causa de um falso negativo do filtro.
+        if pessoas_filtradas:
+            removidas = len(pessoas) - len(pessoas_filtradas)
+            if removidas:
+                print(
+                    f"[filtro pessoas] página {pub.get('pagina')}: removida(s) {removidas} "
+                    f"pessoa(s) que não aparecia(m) no conteúdo oficial dessa publicação.",
+                    file=sys.stderr,
+                )
+            pub["pessoas"] = pessoas_filtradas
+    return dados
+
+
 def extrair_publicacoes(paginas):
     if not paginas:
         return {"paginas_com_atos": [], "publicacoes": []}
@@ -412,6 +486,7 @@ def extrair_publicacoes(paginas):
             print(f"[tentativa {tentativa}] resposta recebida ({len(conteudo)} caractere(s)).", file=sys.stderr)
             try:
                 resultado = _extrair_json(conteudo)
+                resultado = _filtrar_pessoas_consistentes(resultado)
                 if not resultado.get("publicacoes"):
                     # O JSON veio válido, mas "vazio" — como isso é suspeito
                     # (recebemos páginas pra analisar), registra a resposta
