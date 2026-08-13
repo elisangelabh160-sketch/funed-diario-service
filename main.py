@@ -9,14 +9,16 @@ Pipeline:
      estruturado (mesmo "shape" que o fluxo n8n já produzia).
   3. Renderiza esse JSON no MESMO layout HTML do e-mail atual (cabeçalho azul, box de
      resumo, card por publicação, box bege com o conteúdo oficial, resumo objetivo).
-  4. Envia por e-mail via Gmail (SMTP + App Password), para a lista fixa da equipe SDC.
+  4. Envia por e-mail via Brevo (API de e-mail transacional, plano grátis de 300
+     e-mails/dia), para a lista fixa da equipe SDC.
 
 Segredos esperados como variáveis de ambiente (configure como GitHub Actions Secrets):
   RENDER_BASE_URL        -> ex: https://funed-diario-service.onrender.com (sem barra no final)
   SERVICE_API_KEY        -> a mesma chave já configurada no ambiente do seu serviço no Render
   OPENROUTER_API_KEY     -> chave gratuita do OpenRouter (openrouter.ai/keys)
-  GMAIL_USER              -> conta Gmail remetente (ex: elisangelabh160@gmail.com)
-  GMAIL_APP_PASSWORD     -> senha de app do Gmail (não é a senha normal da conta)
+  BREVO_API_KEY           -> chave de API da conta Brevo (app.brevo.com/settings/keys/api)
+  REMETENTE_EMAIL         -> e-mail JÁ VERIFICADO como remetente na conta Brevo
+  REMETENTE_NOME          -> (opcional) nome de exibição do remetente
   DESTINATARIOS           -> lista de e-mails separados por vírgula
 
 Contrato real do endpoint (confirmado lendo app.py/README do repositório
@@ -30,13 +32,10 @@ funed-diario-service):
 import json
 import os
 import re
-import smtplib
 import sys
 import time
 import unicodedata
 from datetime import date
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 import requests
 
@@ -47,8 +46,18 @@ import requests
 RENDER_BASE_URL = os.environ["RENDER_BASE_URL"].rstrip("/")
 SERVICE_API_KEY = os.environ["SERVICE_API_KEY"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
-GMAIL_USER = os.environ["GMAIL_USER"]
-GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
+
+# Trocado de Gmail SMTP pra Brevo (API de e-mail transacional, 300 e-mails/dia
+# grátis) porque os e-mails institucionais (@funed.mg.gov.br) estavam caindo
+# direto em quarentena no filtro anti-spam da FUNED quando enviados por uma
+# conta Gmail pessoal — a Brevo tem autenticação/reputação própria de envio,
+# o que reduz bastante esse tipo de bloqueio.
+BREVO_API_KEY = os.environ["BREVO_API_KEY"]
+# Precisa ser um e-mail JÁ VERIFICADO como remetente na conta Brevo
+# (Configurações -> Remetentes, domínios e IPs dedicados -> Remetentes).
+REMETENTE_EMAIL = os.environ["REMETENTE_EMAIL"]
+REMETENTE_NOME = os.environ.get("REMETENTE_NOME", "Elisangela Ferreira da Silva")
+
 DESTINATARIOS = [e.strip() for e in os.environ["DESTINATARIOS"].split(",") if e.strip()]
 
 # Modelo gratuito do OpenRouter (sem custo, $0/token). Se este deixar de existir,
@@ -594,23 +603,37 @@ def renderizar_email_html(dados):
 
 
 # --------------------------------------------------------------------------
-# 4. Enviar por e-mail (Gmail SMTP + App Password)
+# 4. Enviar por e-mail (Brevo - API de e-mail transacional)
 # --------------------------------------------------------------------------
 
 def enviar_email(html, destinatarios):
     assunto = f"Resumo Diário Oficial FUNED - {DATA_HOJE_BR}"
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = assunto
-    msg["From"] = f"Elisangela Ferreira da Silva <{GMAIL_USER}>"
-    msg["To"] = ", ".join(destinatarios)
-    msg.attach(MIMEText(html, "html", "utf-8"))
+    corpo = {
+        "sender": {"name": REMETENTE_NOME, "email": REMETENTE_EMAIL},
+        "to": [{"email": e} for e in destinatarios],
+        "subject": assunto,
+        "htmlContent": html,
+    }
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as servidor:
-        servidor.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        servidor.sendmail(GMAIL_USER, destinatarios, msg.as_string())
+    resp = requests.post(
+        "https://api.brevo.com/v3/smtp/email",
+        headers={
+            "api-key": BREVO_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        json=corpo,
+        timeout=60,
+    )
+    if resp.status_code >= 300:
+        # Mostra o corpo da resposta de erro no log — ajuda a diagnosticar
+        # coisas como "remetente não verificado" ou "chave inválida".
+        raise RuntimeError(
+            f"Falha ao enviar e-mail via Brevo (status {resp.status_code}): {resp.text[:1000]}"
+        )
 
-    print(f"E-mail enviado para: {', '.join(destinatarios)}")
+    print(f"E-mail enviado (via Brevo) para: {', '.join(destinatarios)}")
 
 
 # --------------------------------------------------------------------------
