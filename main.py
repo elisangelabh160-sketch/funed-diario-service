@@ -315,7 +315,19 @@ def extrair_publicacoes(paginas):
                 raise ValueError(f"resposta da OpenRouter sem 'choices': {json.dumps(corpo_resposta)[:1000]}")
             conteudo = corpo_resposta["choices"][0]["message"]["content"]
             try:
-                return _extrair_json(conteudo)
+                resultado = _extrair_json(conteudo)
+                if not resultado.get("publicacoes"):
+                    # O JSON veio válido, mas "vazio" — como isso é suspeito
+                    # (recebemos páginas pra analisar), registra a resposta
+                    # bruta do modelo mesmo sem erro, pra dar pra conferir
+                    # depois se ele realmente não achou nada ou se ignorou
+                    # conteúdo que devia ter pego.
+                    print(
+                        f"[tentativa {tentativa}] modelo devolveu JSON válido mas SEM publicações "
+                        f"(resposta bruta): {conteudo[:3000]!r}",
+                        file=sys.stderr,
+                    )
+                return resultado
             except Exception as erro_parse:  # noqa: BLE001
                 # Mostra a resposta bruta do modelo no log, pra dar pra ver
                 # exatamente o que veio quando o parse falha.
@@ -435,6 +447,10 @@ def main():
 
     paginas = buscar_paginas_diario()
     print(f"{len(paginas)} página(s) recebida(s) do serviço Render.")
+    for p in paginas:
+        tamanho = len(p.get("texto") or "")
+        inicio_texto = (p.get("texto") or "")[:120].replace("\n", " ")
+        print(f"  -> página {p.get('numero')}: {tamanho} caractere(s) — início: {inicio_texto!r}")
 
     dados = extrair_publicacoes(paginas)
     print(f"{len(dados.get('publicacoes', []))} publicação(ões) identificada(s).")
