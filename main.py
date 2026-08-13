@@ -174,6 +174,26 @@ formato exato:
 
 Regras importantes:
 - Considere APENAS publicações relacionadas à FUNED (Fundação Ezequiel Dias), diretas ou indiretas.
+- ATENÇÃO: cada página do Diário costuma trazer atos de VÁRIOS órgãos diferentes do
+  governo de Minas Gerais (Secretaria de Educação, Secretaria de Saúde, IPSEMG, FHEMIG,
+  FUNED, etc.), muitas vezes em tabelas ou listas genéricas compartilhadas por vários
+  órgãos ao mesmo tempo (ex: uma lista única de "licenças para tratamento de saúde
+  indeferidas" que junta servidores de vários órgãos diferentes). A palavra "FUNED" ou
+  "Fundação Ezequiel Dias" aparecer EM ALGUM LUGAR da página NÃO significa que a página
+  inteira (ou a tabela inteira) seja da FUNED. Antes de incluir qualquer item, confirme
+  que aquele item específico está de fato atribuído à FUNED — porque está sob um
+  cabeçalho/seção com o nome "Fundação Ezequiel Dias" ou "FUNED", ou porque o próprio
+  texto do item cita a FUNED como o órgão responsável por aquele ato. Se uma tabela tiver
+  uma coluna "Órgão" (ou equivalente) e ela não disser FUNED para aquela linha, NÃO inclua
+  essa linha, mesmo que a palavra FUNED apareça em outro lugar da mesma página.
+- Se restar dúvida real se um item é ou não da FUNED (ambiguidade genuína, não apenas
+  "a palavra apareceu na página"), prefira NÃO incluir a ficar incluindo itens errados.
+- Se uma seção realmente da FUNED tiver uma tabela repetitiva com muitos registros do
+  mesmo tipo (ex: vários servidores da FUNED com licença indeferida na mesma seção),
+  AGRUPE tudo em UMA única publicação (mesma "categoria"/"tipo_do_ato"), listando todas
+  as pessoas em "pessoas" — não crie uma publicação separada pra cada pessoa. Isso evita
+  gastar espaço de resposta com dezenas de itens repetidos e ajuda a garantir espaço pra
+  outros atos (como portarias completas) que também estejam na mesma página.
 - "conteudo_oficial" deve ser um recorte fiel do texto original da página (não invente, não resuma aqui).
 - "resumo_objetivo" é o único campo que deve estar em linguagem simplificada.
 - Se uma publicação citar múltiplas pessoas, liste todas em "pessoas".
