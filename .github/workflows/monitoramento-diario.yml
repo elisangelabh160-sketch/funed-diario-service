@@ -2,10 +2,15 @@ name: Monitoramento Diário Oficial FUNED
 
 on:
   schedule:
-    # 11:00 UTC = 08:00 horário de Brasília (BRT, UTC-3 o ano todo, sem
+    # 11:07 UTC = 08:07 horário de Brasília (BRT, UTC-3 o ano todo, sem
     # horário de verão), de terça a sábado.
+    # OBS: de propósito NÃO é "0 11" (hora cheia) — o próprio GitHub recomenda
+    # evitar agendar exatamente no minuto 0, porque é o horário de maior
+    # concorrência entre todos os workflows agendados da plataforma, e nesse
+    # pico o disparo pode atrasar bastante ou até ser descartado. Alguns
+    # minutos de diferença já reduz bastante esse risco.
     # Ajuste o horário aqui se precisar (lembre-se: o valor é sempre em UTC).
-    - cron: "0 11 * * 2-6"
+    - cron: "7 11 * * 2-6"
   workflow_dispatch: {}  # permite rodar manualmente pela aba "Actions" no GitHub
 
 jobs:
