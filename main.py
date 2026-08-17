@@ -153,6 +153,20 @@ def buscar_paginas_diario():
         except Exception as e:  # noqa: BLE001
             ultimo_erro = e
             print(f"[tentativa {tentativa}] erro ao chamar Render: {e}", file=sys.stderr)
+            # --- DIAGNÓSTICO TEMPORÁRIO: mostra a resposta HTTP completa (se
+            # houver uma) para descobrir se quem respondeu 404 foi o nosso
+            # app (FastAPI) ou algo no meio do caminho (proxy/borda do Render).
+            resp_erro = getattr(e, "response", None)
+            if resp_erro is not None:
+                print(
+                    f"[debug] status={resp_erro.status_code} "
+                    f"headers={dict(resp_erro.headers)} "
+                    f"corpo={resp_erro.text[:500]!r}",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"[debug] exceção sem resposta HTTP associada (tipo: {type(e).__name__})", file=sys.stderr)
+            # --- FIM DO DIAGNÓSTICO TEMPORÁRIO ---
             if tentativa < MAX_TENTATIVAS:
                 # espera mais a cada tentativa (15s, 30s, 45s...) — dá mais
                 # tempo pra instância terminar de acordar entre as tentativas.
