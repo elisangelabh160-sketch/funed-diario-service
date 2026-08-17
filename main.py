@@ -147,20 +147,26 @@ def buscar_paginas_diario():
 # 2. Extrair/estruturar as publicações com um modelo gratuito do OpenRouter
 # --------------------------------------------------------------------------
 
+# IMPORTANTE: este prompt processa UMA página por vez (ver extrair_publicacoes
+# mais abaixo). Isso é proposital — quando mandávamos várias páginas juntas
+# numa única chamada, o modelo gratuito às vezes "embaralhava" o número da
+# página entre publicações (ex: pegava o conteúdo real da página 27 e
+# etiquetava como "página 23") e chegou a esquecer de extrair o conteúdo de
+# uma página inteira. Processando uma página por vez, o número da página nunca
+# precisa ser "adivinhado" pelo modelo — o código já sabe qual é e o preenche
+# depois, então esse tipo de erro fica impossível.
 PROMPT_SISTEMA = """detailed thinking off
 
-Você é um assistente que analisa o Diário Oficial de Minas Gerais (Diário do \
-Executivo) em busca de publicações relacionadas à Fundação Ezequiel Dias (FUNED). \
-Você recebe o texto de várias páginas do Diário e deve devolver APENAS um JSON \
-válido (sem markdown, sem texto fora do JSON, sem explicar seu raciocínio, sem \
-escrever "thinking process" ou qualquer texto antes/depois do JSON), no seguinte \
-formato exato:
+Você é um assistente que analisa UMA página do Diário Oficial de Minas Gerais \
+(Diário do Executivo) em busca de publicações relacionadas à Fundação Ezequiel \
+Dias (FUNED). Você recebe o texto de uma única página e deve devolver APENAS um \
+JSON válido (sem markdown, sem texto fora do JSON, sem explicar seu raciocínio, \
+sem escrever "thinking process" ou qualquer texto antes/depois do JSON), no \
+seguinte formato exato:
 
 {
-  "paginas_com_atos": [8, 31, 33],
   "publicacoes": [
     {
-      "pagina": 8,
       "categoria": "ato próprio da FUNED" | "menção indireta",
       "tipo_do_ato": "string curta descrevendo o tipo do ato",
       "data_periodo": "data(s) ou período do ato, como aparece no texto",
@@ -174,8 +180,15 @@ formato exato:
 }
 
 Regras importantes:
-- Considere APENAS publicações relacionadas à FUNED (Fundação Ezequiel Dias), diretas ou indiretas.
-- ATENÇÃO: cada página do Diário costuma trazer atos de VÁRIOS órgãos diferentes do
+- Considere APENAS publicações relacionadas à FUNED (Fundação Ezequiel Dias), diretas ou indiretas, que estejam NESTA página.
+- IMPORTANTE: releia a página INTEIRA antes de responder e procure TODAS as
+  ocorrências das palavras "Funed" ou "Fundação Ezequiel Dias" no texto — elas
+  podem aparecer mais de uma vez, em tabelas diferentes ou em partes distantes
+  da página (ex: uma tabela de licenças DEFERIDAS em um trecho e outra de
+  licenças INDEFERIDAS em outro trecho da mesma página). NÃO pare na primeira
+  ocorrência encontrada: cada ocorrência distinta deve virar uma publicação
+  (ou ser agrupada com outras do mesmo tipo, conforme a regra abaixo).
+- ATENÇÃO: uma mesma página do Diário costuma trazer atos de VÁRIOS órgãos diferentes do
   governo de Minas Gerais (Secretaria de Educação, Secretaria de Saúde, IPSEMG, FHEMIG,
   FUNED, etc.), muitas vezes em tabelas ou listas genéricas compartilhadas por vários
   órgãos ao mesmo tempo (ex: uma lista única de "licenças para tratamento de saúde
@@ -189,12 +202,14 @@ Regras importantes:
   essa linha, mesmo que a palavra FUNED apareça em outro lugar da mesma página.
 - Se restar dúvida real se um item é ou não da FUNED (ambiguidade genuína, não apenas
   "a palavra apareceu na página"), prefira NÃO incluir a ficar incluindo itens errados.
-- Se uma seção realmente da FUNED tiver uma tabela repetitiva com muitos registros do
-  mesmo tipo (ex: vários servidores da FUNED com licença indeferida na mesma seção),
+- Se a página tiver uma tabela repetitiva com muitos registros do mesmo tipo da FUNED
+  (ex: vários servidores da FUNED com licença indeferida na mesma seção),
   AGRUPE tudo em UMA única publicação (mesma "categoria"/"tipo_do_ato"), listando todas
   as pessoas em "pessoas" — não crie uma publicação separada pra cada pessoa. Isso evita
   gastar espaço de resposta com dezenas de itens repetidos e ajuda a garantir espaço pra
-  outros atos (como portarias completas) que também estejam na mesma página.
+  outros atos (como portarias completas) que também estejam na mesma página. Mas se
+  houver tabelas SEPARADAS de tipos diferentes (ex: uma de licenças DEFERIDAS e outra de
+  licenças INDEFERIDAS), cada uma é uma publicação diferente — não junte as duas.
 - "conteudo_oficial" deve ser um recorte fiel do texto original da página (não invente, não resuma aqui).
 - IMPORTANTE: o campo "pessoas" de uma publicação deve conter SOMENTE pessoas que também
   apareçam no texto de "conteudo_oficial" DESSA MESMA publicação. Nunca copie nomes de uma
@@ -203,17 +218,14 @@ Regras importantes:
   realmente extraiu. As duas listas têm que bater.
 - "resumo_objetivo" é o único campo que deve estar em linguagem simplificada.
 - Se uma publicação citar múltiplas pessoas, liste todas em "pessoas".
-- Se não houver NENHUMA publicação relacionada à FUNED em nenhuma página, devolva:
-  {"paginas_com_atos": [], "publicacoes": []}
-- Nunca invente números de página, MASP ou datas que não estejam no texto fornecido.
+- Se não houver NENHUMA publicação relacionada à FUNED nesta página, devolva:
+  {"publicacoes": []}
+- Nunca invente MASP ou datas que não estejam no texto fornecido.
 """
 
 
-def montar_prompt_usuario(paginas):
-    blocos = []
-    for p in paginas:
-        blocos.append(f"--- PÁGINA {p['numero']} ---\n{p['texto']}")
-    return "\n\n".join(blocos)
+def montar_prompt_usuario_pagina(pagina):
+    return f"--- PÁGINA {pagina['numero']} ---\n{pagina['texto']}"
 
 
 def _fim_do_objeto(texto, inicio):
@@ -439,21 +451,20 @@ def _filtrar_pessoas_consistentes(dados):
     return dados
 
 
-def extrair_publicacoes(paginas):
-    if not paginas:
-        return {"paginas_com_atos": [], "publicacoes": []}
-
+def _chamar_llm_para_pagina(pagina):
+    """Faz a chamada à OpenRouter para o texto de UMA única página e devolve o
+    JSON já extraído (dict com "publicacoes"). Repete em caso de erro."""
     corpo = {
         "model": MODELO_LLM,
         "messages": [
             {"role": "system", "content": PROMPT_SISTEMA},
-            {"role": "user", "content": montar_prompt_usuario(paginas)},
+            {"role": "user", "content": montar_prompt_usuario_pagina(pagina)},
         ],
         "temperature": 0.1,
-        # Esse modelo aceita até 32768 tokens de resposta. Com várias páginas
-        # e várias pessoas por publicação, 10000 estava cortando a resposta
-        # no meio (por isso o e-mail saía "vazio" mesmo tendo publicações).
-        "max_tokens": 28000,
+        # Como agora é só uma página por chamada, a resposta tende a ser bem
+        # menor que antes — mas deixamos uma folga generosa pra páginas com
+        # tabelas grandes da FUNED (esse modelo aceita até 32768).
+        "max_tokens": 16000,
         "response_format": {"type": "json_object"},
         # Caso o modelo escolhido tenha uma etapa de "raciocínio" opcional,
         # isso pede pra ele não gastar tokens de resposta com isso. Modelos
@@ -471,9 +482,7 @@ def extrair_publicacoes(paginas):
                     "Content-Type": "application/json",
                 },
                 json=corpo,
-                # com max_tokens bem maior, a resposta pode demorar mais pra
-                # ser gerada — dá mais tempo antes de desistir.
-                timeout=240,
+                timeout=180,
             )
             resp.raise_for_status()
             corpo_resposta = resp.json()
@@ -483,19 +492,21 @@ def extrair_publicacoes(paginas):
                 # corpo inteiro no log pra dar pra entender o motivo.
                 raise ValueError(f"resposta da OpenRouter sem 'choices': {json.dumps(corpo_resposta)[:1000]}")
             conteudo = corpo_resposta["choices"][0]["message"]["content"]
-            print(f"[tentativa {tentativa}] resposta recebida ({len(conteudo)} caractere(s)).", file=sys.stderr)
+            print(
+                f"  [página {pagina['numero']} / tentativa {tentativa}] resposta recebida "
+                f"({len(conteudo)} caractere(s)).",
+                file=sys.stderr,
+            )
             try:
                 resultado = _extrair_json(conteudo)
-                resultado = _filtrar_pessoas_consistentes(resultado)
                 if not resultado.get("publicacoes"):
-                    # O JSON veio válido, mas "vazio" — como isso é suspeito
-                    # (recebemos páginas pra analisar), registra a resposta
+                    # O JSON veio válido, mas "vazio" — registra a resposta
                     # bruta do modelo mesmo sem erro, pra dar pra conferir
                     # depois se ele realmente não achou nada ou se ignorou
                     # conteúdo que devia ter pego.
                     print(
-                        f"[tentativa {tentativa}] modelo devolveu JSON válido mas SEM publicações "
-                        f"(resposta bruta): {conteudo[:3000]!r}",
+                        f"  [página {pagina['numero']} / tentativa {tentativa}] modelo devolveu JSON "
+                        f"válido mas SEM publicações (resposta bruta): {conteudo[:2000]!r}",
                         file=sys.stderr,
                     )
                 return resultado
@@ -503,14 +514,14 @@ def extrair_publicacoes(paginas):
                 # Mostra a resposta bruta do modelo no log, pra dar pra ver
                 # exatamente o que veio quando o parse falha.
                 print(
-                    f"[tentativa {tentativa}] resposta bruta do modelo "
+                    f"  [página {pagina['numero']} / tentativa {tentativa}] resposta bruta do modelo "
                     f"(não foi possível extrair JSON): {conteudo[:2000]!r}",
                     file=sys.stderr,
                 )
                 raise erro_parse
         except Exception as e:  # noqa: BLE001
             ultimo_erro = e
-            print(f"[tentativa {tentativa}] erro ao chamar OpenRouter: {e}", file=sys.stderr)
+            print(f"  [página {pagina['numero']} / tentativa {tentativa}] erro ao chamar OpenRouter: {e}", file=sys.stderr)
             if tentativa < MAX_TENTATIVAS:
                 # "429 muitas requisições" precisa de mais tempo de espera do
                 # que os outros erros, senão a tentativa seguinte esbarra no
@@ -518,7 +529,47 @@ def extrair_publicacoes(paginas):
                 espera = 20 if "429" in str(e) else (ESPERA_ENTRE_TENTATIVAS_MS / 1000)
                 time.sleep(espera)
 
-    raise RuntimeError(f"Falha ao extrair publicações via LLM após {MAX_TENTATIVAS} tentativas: {ultimo_erro}")
+    raise RuntimeError(f"Falha ao extrair publicações da página {pagina['numero']} após {MAX_TENTATIVAS} tentativas: {ultimo_erro}")
+
+
+def extrair_publicacoes(paginas):
+    """Analisa cada página separadamente (uma chamada à IA por página) e junta
+    os resultados. Ver o comentário grande acima de PROMPT_SISTEMA pra
+    entender por que isso é feito página a página, e não tudo de uma vez."""
+    if not paginas:
+        return {"paginas_com_atos": [], "publicacoes": []}
+
+    todas_publicacoes = []
+    paginas_com_atos = []
+
+    for i, pagina in enumerate(paginas):
+        print(f"Analisando página {pagina['numero']} com a IA ({i + 1}/{len(paginas)})...", file=sys.stderr)
+        try:
+            resultado_pagina = _chamar_llm_para_pagina(pagina)
+        except Exception as e:  # noqa: BLE001
+            # Se UMA página falhar (mesmo após as tentativas), não perde as
+            # outras — registra o erro e segue pras próximas páginas.
+            print(f"Falha ao analisar a página {pagina['numero']}, pulando essa página: {e}", file=sys.stderr)
+            continue
+
+        publicacoes_pagina = resultado_pagina.get("publicacoes") or []
+        if publicacoes_pagina:
+            # Força o número da página com o valor que a GENTE já sabe (veio
+            # do serviço de raspagem), em vez de confiar no que o modelo
+            # eventualmente tenha tentado inventar/repetir — é exatamente
+            # isso que evita o bug de páginas trocadas entre publicações.
+            for pub in publicacoes_pagina:
+                pub["pagina"] = pagina["numero"]
+            todas_publicacoes.extend(publicacoes_pagina)
+            paginas_com_atos.append(pagina["numero"])
+
+        # pequena pausa entre chamadas pra não estourar o limite de
+        # requisições por minuto do plano gratuito da OpenRouter.
+        if i < len(paginas) - 1:
+            time.sleep(3)
+
+    resultado = {"paginas_com_atos": paginas_com_atos, "publicacoes": todas_publicacoes}
+    return _filtrar_pessoas_consistentes(resultado)
 
 
 # --------------------------------------------------------------------------
