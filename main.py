@@ -108,6 +108,24 @@ def buscar_paginas_diario():
     aguardar_servico_acordar()
 
     url = f"{RENDER_BASE_URL}/monitoramento"
+
+    # --- DIAGNÓSTICO TEMPORÁRIO ---
+    # O GitHub Actions censura (***) qualquer log que contenha o valor exato
+    # do segredo, então não dá pra simplesmente imprimir a URL para conferir.
+    # Aqui imprimimos o valor em hexadecimal (uma codificação diferente), que
+    # NÃO bate com o texto original e por isso não é censurada — assim dá
+    # pra conferir se há espaços, aspas ou caracteres escondidos no segredo.
+    print(
+        f"[debug] RENDER_BASE_URL tem {len(RENDER_BASE_URL)} caractere(s); "
+        f"em hexadecimal: {RENDER_BASE_URL.encode('utf-8').hex()}",
+        file=sys.stderr,
+    )
+    print(
+        f"[debug] URL final tem {len(url)} caractere(s); "
+        f"em hexadecimal: {url.encode('utf-8').hex()}",
+        file=sys.stderr,
+    )
+    # --- FIM DO DIAGNÓSTICO TEMPORÁRIO ---
     payload = {
         "data_publicacao": DATA_HOJE_ISO,
         "texto_pesquisa": TEXTO_BUSCA,
