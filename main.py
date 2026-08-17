@@ -108,24 +108,6 @@ def buscar_paginas_diario():
     aguardar_servico_acordar()
 
     url = f"{RENDER_BASE_URL}/monitoramento"
-
-    # --- DIAGNÓSTICO TEMPORÁRIO ---
-    # O GitHub Actions censura (***) qualquer log que contenha o valor exato
-    # do segredo, então não dá pra simplesmente imprimir a URL para conferir.
-    # Aqui imprimimos o valor em hexadecimal (uma codificação diferente), que
-    # NÃO bate com o texto original e por isso não é censurada — assim dá
-    # pra conferir se há espaços, aspas ou caracteres escondidos no segredo.
-    print(
-        f"[debug] RENDER_BASE_URL tem {len(RENDER_BASE_URL)} caractere(s); "
-        f"em hexadecimal: {RENDER_BASE_URL.encode('utf-8').hex()}",
-        file=sys.stderr,
-    )
-    print(
-        f"[debug] URL final tem {len(url)} caractere(s); "
-        f"em hexadecimal: {url.encode('utf-8').hex()}",
-        file=sys.stderr,
-    )
-    # --- FIM DO DIAGNÓSTICO TEMPORÁRIO ---
     payload = {
         "data_publicacao": DATA_HOJE_ISO,
         "texto_pesquisa": TEXTO_BUSCA,
@@ -137,6 +119,29 @@ def buscar_paginas_diario():
         try:
             # timeout alto: mesmo acordado, o scraping com Playwright pode demorar.
             resp = requests.post(url, json=payload, headers=headers, timeout=180)
+
+            # O serviço responde 404 (com um corpo JSON próprio, não uma
+            # página de erro genérica) quando ele rodou normalmente mas
+            # simplesmente não existe edição do Diário — ou não há nenhuma
+            # publicação com o termo buscado — na data pedida (ex: quando o
+            # workflow é disparado manualmente numa segunda-feira, dia em que
+            # o Diário Oficial de MG não é publicado). Isso NÃO é uma falha:
+            # é um resultado válido de "nada para relatar hoje", então não
+            # deve ser tratado como erro nem tentar de novo — basta seguir
+            # em frente sem páginas, e o e-mail final vai informar
+            # corretamente que não há atos da FUNED na data.
+            if resp.status_code == 404 and resp.headers.get("content-type", "").startswith("application/json"):
+                try:
+                    detalhe = resp.json()
+                except ValueError:
+                    detalhe = {}
+                print(
+                    f"Nenhuma publicação encontrada para {DATA_HOJE_ISO} "
+                    f"(resposta do serviço: {detalhe}). Seguindo sem páginas.",
+                    file=sys.stderr,
+                )
+                return []
+
             resp.raise_for_status()
             corpo = resp.json()
             dados = corpo.get("dados", {})
@@ -153,20 +158,6 @@ def buscar_paginas_diario():
         except Exception as e:  # noqa: BLE001
             ultimo_erro = e
             print(f"[tentativa {tentativa}] erro ao chamar Render: {e}", file=sys.stderr)
-            # --- DIAGNÓSTICO TEMPORÁRIO: mostra a resposta HTTP completa (se
-            # houver uma) para descobrir se quem respondeu 404 foi o nosso
-            # app (FastAPI) ou algo no meio do caminho (proxy/borda do Render).
-            resp_erro = getattr(e, "response", None)
-            if resp_erro is not None:
-                print(
-                    f"[debug] status={resp_erro.status_code} "
-                    f"headers={dict(resp_erro.headers)} "
-                    f"corpo={resp_erro.text[:500]!r}",
-                    file=sys.stderr,
-                )
-            else:
-                print(f"[debug] exceção sem resposta HTTP associada (tipo: {type(e).__name__})", file=sys.stderr)
-            # --- FIM DO DIAGNÓSTICO TEMPORÁRIO ---
             if tentativa < MAX_TENTATIVAS:
                 # espera mais a cada tentativa (15s, 30s, 45s...) — dá mais
                 # tempo pra instância terminar de acordar entre as tentativas.
