@@ -244,6 +244,21 @@ Regras importantes:
 - Se não houver NENHUMA publicação relacionada à FUNED nesta página, devolva:
   {"publicacoes": []}
 - Nunca invente MASP ou datas que não estejam no texto fornecido.
+- ATENÇÃO ESPECIAL às tabelas de "Licenças para tratamento de saúde DEFERIDAS" ou
+  "INDEFERIDAS": essas tabelas às vezes COMEÇAM em uma página anterior (que você não
+  está vendo) e simplesmente CONTINUAM no topo desta página, sem repetir o cabeçalho
+  "DEFERIDAS"/"INDEFERIDAS" no início. Uma mesma página pode conter DUAS OU MAIS dessas
+  tabelas em sequência, cada uma com seu próprio cabeçalho aparecendo ANTES dela no texto.
+  Para decidir se um item é DEFERIDA ou INDEFERIDA, use APENAS o cabeçalho "Licença(s)
+  para tratamento de saúde DEFERIDA(S)" ou "INDEFERIDA(S)" que aparece IMEDIATAMENTE
+  ANTES daquele item na ORDEM do texto (de cima para baixo). NUNCA use um cabeçalho que
+  aparece DEPOIS do item no texto — isso pertence a uma tabela diferente e ainda não
+  começou. Se um item da FUNED aparecer LOGO NO INÍCIO do texto da página, ANTES de
+  qualquer cabeçalho "DEFERIDA(S)"/"INDEFERIDA(S)" aparecer nesta página, significa que a
+  tabela começou na página anterior e você NÃO tem como saber com certeza se é DEFERIDA ou
+  INDEFERIDA só com o texto desta página. Nesse caso, NÃO adivinhe: use
+  "tipo_do_ato": "Licença para tratamento de saúde (categoria DEFERIDA/INDEFERIDA não
+  visível nesta página — tabela iniciada na página anterior)".
 """
 
 
