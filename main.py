@@ -164,6 +164,16 @@ def buscar_paginas_diario():
         except Exception as e:  # noqa: BLE001
             ultimo_erro = e
             print(f"[tentativa {tentativa}] erro ao chamar Render: {e}", file=sys.stderr)
+            # Mostra o corpo do erro (o app.py do Render manda um "detalhe"
+            # explicando qual etapa da automação falhou — ex: portal fora
+            # do ar, botão/campo não encontrado, PDF recusado). Sem isso só
+            # vemos "502 Bad Gateway" genérico e não sabemos onde travou.
+            resp_erro = getattr(e, "response", None)
+            if resp_erro is not None:
+                try:
+                    print(f"[debug] corpo do erro: {resp_erro.json()}", file=sys.stderr)
+                except ValueError:
+                    print(f"[debug] corpo do erro (texto): {resp_erro.text[:1000]!r}", file=sys.stderr)
             if tentativa < MAX_TENTATIVAS:
                 # espera mais a cada tentativa (15s, 30s, 45s...) — dá mais
                 # tempo pra instância terminar de acordar entre as tentativas.
