@@ -69,8 +69,14 @@ TEXTO_BUSCA = os.environ.get("TEXTO_PESQUISA", "Fundação Ezequiel Dias")
 DATA_HOJE_ISO = date.today().isoformat()          # formato exigido pela API: YYYY-MM-DD
 DATA_HOJE_BR = date.today().strftime("%d/%m/%Y")  # formato usado no e-mail
 
-MAX_TENTATIVAS = 3
+MAX_TENTATIVAS = 5
 ESPERA_ENTRE_TENTATIVAS_MS = 5000
+# Aumentado de 3 para 5: em 25/08/2026 vimos o serviço no Render cair
+# ("Instance failed") e se recuperar sozinho pouco depois — instâncias
+# gratuitas do Render podem reiniciar por falta de memória (o Playwright/
+# navegador consome bastante RAM) e demorar até recuperar de vez. Mais
+# tentativas com espera crescente dão tempo pro serviço se estabilizar
+# antes de desistirmos de vez.
 
 
 # --------------------------------------------------------------------------
