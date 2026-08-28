@@ -1,106 +1,34 @@
-GUIA: DISPARO AUTOMÁTICO CONFIÁVEL (via cron-job.org)
-========================================================
+name: Monitoramento Diário Oficial FUNED
 
-POR QUE FAZER ISSO
--------------------
-O agendamento interno do GitHub Actions ("schedule") não é confiável no
-plano gratuito: já vimos atrasos de mais de 50 minutos e dias em que ele
-simplesmente não disparou. A solução é usar um serviço externo, que dispara
-num horário fixo e confiável, chamando a API do GitHub pra rodar o workflow
-(é o mesmo botão "Run workflow" que você já usa manualmente, só que
-disparado automaticamente por outro serviço).
+on:
+  # O agendamento interno do GitHub Actions ("schedule") foi removido de
+  # propósito: no plano gratuito, o GitHub não garante o horário do disparo
+  # agendado — já vimos atrasos de até 50+ minutos e dias em que ele
+  # simplesmente não disparou. Por isso, agora o disparo diário é feito por
+  # um serviço externo (ex: cron-job.org), que chama a API do GitHub num
+  # horário fixo e confiável para rodar este workflow via workflow_dispatch
+  # (o mesmo mecanismo do botão "Run workflow"). Ver instruções de
+  # configuração enviadas junto com este arquivo.
+  workflow_dispatch: {}  # permite rodar manualmente (botão) OU via API externa
 
-Isso é feito em 3 etapas:
-  1. Trocar o arquivo do workflow (monitoramento-diario.yml) — já preparado.
-  2. Criar um token de acesso no GitHub (pra dar permissão ao serviço externo).
-  3. Configurar o cron-job.org pra chamar a API do GitHub todo dia no horário certo.
-
-
-ETAPA 1 — Trocar o workflow
------------------------------
-1. Abra o arquivo monitoramento-diario.yml no repositório (dentro de
-   .github/workflows/) e clique no lápis (Edit).
-2. Selecione tudo, apague, e cole o conteúdo do arquivo
-   "monitoramento-diario_v2.yml" que também te mandei.
-3. Commit changes.
-
-(Esse novo arquivo remove o agendamento interno do GitHub — que não
-funcionava direito — e mantém só o "workflow_dispatch", que é o que
-permite rodar via botão OU via chamada de API externa.)
-
-
-ETAPA 2 — Criar um token de acesso no GitHub
------------------------------------------------
-Esse token dá permissão pro cron-job.org "apertar o botão" de rodar o
-workflow por você, sem precisar da sua senha.
-
-1. No GitHub, clique na sua foto de perfil (canto superior direito) →
-   "Settings".
-2. No menu da esquerda, role até o final e clique em "Developer settings".
-3. Clique em "Personal access tokens" → "Fine-grained tokens".
-4. Clique em "Generate new token".
-5. Preencha:
-   - Token name: cron-monitoramento-funed
-   - Expiration: escolha "No expiration" (ou o prazo máximo disponível,
-     ex: 1 ano — só lembre de renovar antes de vencer).
-   - Resource owner: sua conta (elisangelabh160-sketch)
-   - Repository access: escolha "Only select repositories" e selecione
-     "funed-diario-service".
-6. Em "Permissions", clique em "Repository permissions" e procure por
-   "Actions". Mude de "No access" para "Read and write".
-7. Role até o final e clique em "Generate token".
-8. IMPORTANTE: o token só aparece UMA VEZ na tela, começando com
-   "github_pat_...". Copie ele agora (não precisa me mandar — você vai
-   colar direto no cron-job.org na próxima etapa) e guarde num lugar
-   seguro (ex: gerenciador de senhas) caso precise reconfigurar depois.
-
-
-ETAPA 3 — Configurar o cron-job.org
---------------------------------------
-1. Acesse https://cron-job.org e crie uma conta gratuita (pode usar o
-   mesmo e-mail do FUNED ou um pessoal, não importa).
-2. Depois de logar, clique em "Create cronjob".
-3. Preencha:
-
-   Title: Monitoramento Diário FUNED
-
-   Address (URL):
-   https://api.github.com/repos/elisangelabh160-sketch/funed-diario-service/actions/workflows/monitoramento-diario.yml/dispatches
-
-4. Clique na aba "Advanced" (ou "Common" dependendo da versão) e configure:
-
-   Request method: POST
-
-   Em "Headers" (cabeçalhos), adicione estes 3:
-     Authorization    = Bearer SEU_TOKEN_AQUI   (cole o token da Etapa 2
-                          logo depois da palavra "Bearer " — com espaço)
-     Accept           = application/vnd.github+json
-     Content-Type     = application/json
-
-   Em "Request body" (corpo da requisição), cole exatamente:
-     {"ref":"main"}
-
-5. Configure o agendamento (Schedule):
-   - Dias: terça a sábado (Tue, Wed, Thu, Fri, Sat)
-   - Horário: 07:15
-   - Fuso horário: procure a opção de timezone e escolha
-     "America/Sao_Paulo" (assim você não precisa converter pra UTC — o
-     cron-job.org faz isso sozinho).
-
-6. Salve ("Create cronjob" ou "Save").
-
-7. TESTE AGORA: a maioria dos planos do cron-job.org tem um botão
-   "Run now" / "Execute now" / um ícone de "play" ao lado do cronjob que
-   você acabou de criar. Clique nele.
-   - Se funcionou, a resposta deve ser algo como "204 No Content" (esse é
-     o código de sucesso da API do GitHub — parece "vazio" mas é o
-     esperado).
-   - Depois, vá na aba "Actions" do repositório no GitHub e confira se
-     apareceu uma nova execução do workflow rodando — foi disparada pelo
-     cron-job.org!
-
-Depois de confirmar que o teste manual funcionou, pode deixar rodando
-sozinho: todo dia às 07:15 (terça a sábado) o cron-job.org vai chamar a
-API do GitHub, que vai rodar o workflow, que vai chamar a Render, que vai
-buscar o Diário e mandar o e-mail — sem depender mais do agendador interno
-do GitHub, que era o que estava falhando.
+jobs:
+  monitorar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+      - name: Rodar monitoramento e enviar e-mail
+        env:
+          RENDER_BASE_URL: ${{ secrets.RENDER_BASE_URL }}
+          SERVICE_API_KEY: ${{ secrets.SERVICE_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          DESTINATARIOS: ${{ secrets.DESTINATARIOS }}
+        run: python main.py
