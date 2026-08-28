@@ -77,6 +77,28 @@ ESPERA_ENTRE_TENTATIVAS_MS = 5000
 # navegador consome bastante RAM) e demorar até recuperar de vez. Mais
 # tentativas com espera crescente dão tempo pro serviço se estabilizar
 # antes de desistirmos de vez.
+# (Esse MAX_TENTATIVAS é usado só no loop de extração por página com a
+# IA, mais abaixo — chamadas rápidas, então 5 tentativas curtas fazem
+# sentido ali.)
+
+# --------------------------------------------------------------------------
+# Chamada ao /monitoramento do Render (busca das páginas via Playwright):
+# usa constantes PRÓPRIAS, diferentes do MAX_TENTATIVAS acima, porque essa
+# chamada é fundamentalmente diferente das outras: o app.py do Render JÁ
+# tenta de novo sozinho, internamente, até 4 vezes por chamada (com pausas
+# de 5s/10s/20s entre elas) antes de responder — e cada uma dessas
+# tentativas internas pode legitimamente levar minutos (abrir o portal,
+# esperar a pesquisa, buscar a edição, baixar o PDF). Em 28/08/2026 vimos
+# isso na prática: com um timeout de 180s por chamada e 5 tentativas
+# externas aqui, todas as tentativas estouravam o tempo (Read timed out)
+# mesmo com o serviço funcionando normalmente — o portal só estava mais
+# lento naquele dia, e a soma das tentativas internas do Render facilmente
+# passa de 180s. Resultado: menos tentativas por fora, mas cada uma com
+# tempo de sobra pra deixar o Render terminar sozinho o que já está
+# tentando fazer, em vez de cortar a chamada no meio e tentar de novo do
+# zero (o que só reinicia o relógio sem resolver nada).
+MAX_TENTATIVAS_RENDER = 2
+TIMEOUT_RENDER_S = 600  # 10 min: cobre com folga o pior caso das 4 tentativas internas do app.py
 
 
 # --------------------------------------------------------------------------
@@ -121,10 +143,13 @@ def buscar_paginas_diario():
     headers = {"X-API-Key": SERVICE_API_KEY}
 
     ultimo_erro = None
-    for tentativa in range(1, MAX_TENTATIVAS + 1):
+    for tentativa in range(1, MAX_TENTATIVAS_RENDER + 1):
         try:
-            # timeout alto: mesmo acordado, o scraping com Playwright pode demorar.
-            resp = requests.post(url, json=payload, headers=headers, timeout=180)
+            # timeout alto: o app.py já tenta de novo internamente (até 4x),
+            # então essa chamada por fora precisa de tempo de sobra pra
+            # deixar ele terminar sozinho (ver comentário acima, perto da
+            # definição de MAX_TENTATIVAS_RENDER e TIMEOUT_RENDER_S).
+            resp = requests.post(url, json=payload, headers=headers, timeout=TIMEOUT_RENDER_S)
 
             # O serviço responde 404 (com um corpo JSON próprio, não uma
             # página de erro genérica) quando ele rodou normalmente mas
@@ -174,12 +199,12 @@ def buscar_paginas_diario():
                     print(f"[debug] corpo do erro: {resp_erro.json()}", file=sys.stderr)
                 except ValueError:
                     print(f"[debug] corpo do erro (texto): {resp_erro.text[:1000]!r}", file=sys.stderr)
-            if tentativa < MAX_TENTATIVAS:
+            if tentativa < MAX_TENTATIVAS_RENDER:
                 # espera mais a cada tentativa (15s, 30s, 45s...) — dá mais
                 # tempo pra instância terminar de acordar entre as tentativas.
                 time.sleep((ESPERA_ENTRE_TENTATIVAS_MS / 1000) * tentativa * 3)
 
-    raise RuntimeError(f"Falha ao buscar páginas do Diário após {MAX_TENTATIVAS} tentativas: {ultimo_erro}")
+    raise RuntimeError(f"Falha ao buscar páginas do Diário após {MAX_TENTATIVAS_RENDER} tentativas: {ultimo_erro}")
 
 
 # --------------------------------------------------------------------------
