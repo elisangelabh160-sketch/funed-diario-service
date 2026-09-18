@@ -25,6 +25,23 @@ funed-diario-service):
   Header: X-API-Key: <SERVICE_API_KEY>
   Body: {"data_publicacao": "YYYY-MM-DD", "texto_pesquisa": "Fundação Ezequiel Dias"}
   Resposta: {"dados": {"totalPublicacoes": N, "publicacoes": [{"pagina": 8, "textoPagina": "..."}]}}
+
+--------------------------------------------------------------------------
+HISTÓRICO DE CORREÇÕES
+--------------------------------------------------------------------------
+18/09/2026 — Diagnóstico: a página 19 (Portaria FUNED nº 75/2026) sumiu do
+e-mail. Log da execução mostrou que as 5 tentativas de chamar a OpenRouter
+para essa página bateram em "429 Too Many Requests" seguidas, sem nunca
+conseguir uma resposta — não foi a IA "decidindo" que não havia nada da
+FUNED, foi rate limit do plano gratuito. Duas correções aplicadas:
+  1. A espera entre tentativas em caso de 429 agora CRESCE a cada tentativa
+     (20s, 40s, 60s, 80s) em vez de ficar fixa em 20s — dá mais chance do
+     limite por minuto da OpenRouter resetar antes da tentativa seguinte.
+  2. Rede de segurança: comparamos as páginas que o app.py já confirmou (por
+     busca de texto simples, sem IA) contra as páginas que a IA efetivamente
+     extraiu. Qualquer página que mencione "FUNED"/"Fundação Ezequiel Dias"
+     mas não tenha virado publicação agora aparece em um aviso explícito no
+     e-mail, em vez de simplesmente desaparecer sem ninguém notar.
 """
 
 import json
@@ -602,10 +619,13 @@ def _chamar_llm_para_pagina(pagina):
             ultimo_erro = e
             print(f"  [página {pagina['numero']} / tentativa {tentativa}] erro ao chamar OpenRouter: {e}", file=sys.stderr)
             if tentativa < MAX_TENTATIVAS:
-                # "429 muitas requisições" precisa de mais tempo de espera do
-                # que os outros erros, senão a tentativa seguinte esbarra no
-                # mesmo limite de novo.
-                espera = 20 if "429" in str(e) else (ESPERA_ENTRE_TENTATIVAS_MS / 1000)
+                # CORREÇÃO 18/09/2026: "429 muitas requisições" agora espera
+                # progressivamente mais a cada tentativa (20s, 40s, 60s, 80s)
+                # em vez de sempre 20s fixos. Foi exatamente essa espera fixa
+                # que não deu tempo do limite por minuto da OpenRouter resetar
+                # e fez a página 19 (Portaria FUNED nº 75/2026) tomar 429 em
+                # TODAS as 5 tentativas seguidas e sumir do e-mail daquele dia.
+                espera = (20 * tentativa) if "429" in str(e) else (ESPERA_ENTRE_TENTATIVAS_MS / 1000)
                 time.sleep(espera)
 
     raise RuntimeError(f"Falha ao extrair publicações da página {pagina['numero']} após {MAX_TENTATIVAS} tentativas: {ultimo_erro}")
@@ -616,10 +636,11 @@ def extrair_publicacoes(paginas):
     os resultados. Ver o comentário grande acima de PROMPT_SISTEMA pra
     entender por que isso é feito página a página, e não tudo de uma vez."""
     if not paginas:
-        return {"paginas_com_atos": [], "publicacoes": []}
+        return {"paginas_com_atos": [], "publicacoes": [], "paginas_com_falha": []}
 
     todas_publicacoes = []
     paginas_com_atos = []
+    paginas_com_falha = []
 
     for i, pagina in enumerate(paginas):
         print(f"Analisando página {pagina['numero']} com a IA ({i + 1}/{len(paginas)})...", file=sys.stderr)
@@ -627,8 +648,11 @@ def extrair_publicacoes(paginas):
             resultado_pagina = _chamar_llm_para_pagina(pagina)
         except Exception as e:  # noqa: BLE001
             # Se UMA página falhar (mesmo após as tentativas), não perde as
-            # outras — registra o erro e segue pras próximas páginas.
+            # outras — registra o erro, guarda o número da página como
+            # "falha" (pra entrar no aviso da rede de segurança lá embaixo)
+            # e segue pras próximas páginas.
             print(f"Falha ao analisar a página {pagina['numero']}, pulando essa página: {e}", file=sys.stderr)
+            paginas_com_falha.append(pagina["numero"])
             continue
 
         publicacoes_pagina = resultado_pagina.get("publicacoes") or []
@@ -647,7 +671,11 @@ def extrair_publicacoes(paginas):
         if i < len(paginas) - 1:
             time.sleep(3)
 
-    resultado = {"paginas_com_atos": paginas_com_atos, "publicacoes": todas_publicacoes}
+    resultado = {
+        "paginas_com_atos": paginas_com_atos,
+        "publicacoes": todas_publicacoes,
+        "paginas_com_falha": paginas_com_falha,
+    }
     return _filtrar_pessoas_consistentes(resultado)
 
 
@@ -681,6 +709,7 @@ def _card_publicacao(idx, pub):
 def renderizar_email_html(dados):
     paginas_com_atos = dados.get("paginas_com_atos", [])
     publicacoes = dados.get("publicacoes", [])
+    paginas_sem_ato_extraido = dados.get("paginas_sem_ato_extraido", [])
 
     if not publicacoes:
         aviso_sem_resultado = """
@@ -694,6 +723,28 @@ def renderizar_email_html(dados):
         cards_html = "".join(
             _card_publicacao(i + 1, pub) for i, pub in enumerate(publicacoes)
         )
+
+    # CORREÇÃO 18/09/2026 — Rede de segurança: se alguma página que o app.py
+    # já confirmou conter "FUNED"/"Fundação Ezequiel Dias" (busca de texto
+    # simples, sem IA) não virou nenhuma publicação (seja porque a IA falhou
+    # nela, seja porque decidiu — certa ou erradamente — que não havia ato
+    # da FUNED ali), isso agora aparece como um aviso explícito no e-mail,
+    # em vez de a página simplesmente desaparecer sem ninguém perceber. Foi
+    # assim que a Portaria FUNED nº 75/2026 (página 19) sumiu do e-mail de
+    # 18/09/2026: a página tomou "429 Too Many Requests" da OpenRouter em
+    # TODAS as 5 tentativas e foi pulada silenciosamente.
+    aviso_paginas_nao_confirmadas = ""
+    if paginas_sem_ato_extraido:
+        lista_paginas = ", ".join(str(p) for p in paginas_sem_ato_extraido)
+        aviso_paginas_nao_confirmadas = f"""
+        <div style="background:#fdf3e7; border-left:4px solid #d9822b; border-radius:6px; padding:16px; margin:20px 0;">
+          <p style="margin:0; color:#8a5a1e;"><strong>⚠️ Atenção — verificação manual recomendada:</strong>
+          a(s) página(s) {lista_paginas} menciona(m) "FUNED"/"Fundação Ezequiel Dias" no texto do Diário Oficial de hoje,
+          mas o resumo automático não conseguiu identificar/confirmar um ato específico nelas
+          (pode ter sido uma falha temporária da IA, ou um caso ambíguo). Recomenda-se conferir
+          essa(s) página(s) diretamente no Diário Oficial.</p>
+        </div>
+        """
 
     resumo_box = f"""
     <div style="background:#eef2f7; border-left:4px solid #2563a8; border-radius:6px; padding:16px; margin:20px 0;">
@@ -711,6 +762,7 @@ def renderizar_email_html(dados):
       </div>
       <div style="border:1px solid #e2e8f0; border-top:none; border-radius:0 0 8px 8px; padding:24px;">
         {resumo_box}
+        {aviso_paginas_nao_confirmadas}
         {aviso_sem_resultado}
         {cards_html}
         <hr style="border:none; border-top:1px solid #e2e8f0; margin:24px 0;">
@@ -759,6 +811,20 @@ def main():
 
     dados = extrair_publicacoes(paginas)
     print(f"{len(dados.get('publicacoes', []))} publicação(ões) identificada(s).")
+
+    # CORREÇÃO 18/09/2026 — Rede de segurança (ver comentário em
+    # renderizar_email_html): compara as páginas que o app.py já confirmou
+    # conter o termo buscado contra as páginas que a IA efetivamente
+    # transformou em publicação. A diferença vira aviso no e-mail.
+    paginas_recebidas_numeros = {p["numero"] for p in paginas}
+    paginas_confirmadas_numeros = set(dados.get("paginas_com_atos", []))
+    dados["paginas_sem_ato_extraido"] = sorted(paginas_recebidas_numeros - paginas_confirmadas_numeros)
+    if dados["paginas_sem_ato_extraido"]:
+        print(
+            f"⚠️ Página(s) com termo encontrado mas SEM publicação extraída pela IA: "
+            f"{dados['paginas_sem_ato_extraido']} — incluindo aviso no e-mail.",
+            file=sys.stderr,
+        )
 
     html = renderizar_email_html(dados)
     enviar_email(html, DESTINATARIOS)
