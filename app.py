@@ -33,7 +33,7 @@ STATUS_REPETIVEIS = {401, 408, 429, 500, 502, 503, 504}
 
 app = FastAPI(
     title="FUNED Diário Oficial Service",
-    version="3.3.0",
+    version="3.4.0",
 )
 
 
@@ -367,6 +367,13 @@ def extrair_publicacoes_pdf(
 
     publicacoes: list[dict[str, Any]] = []
     paginas_sem_texto: list[int] = []
+    # CORREÇÃO 18/09/2026: guarda o texto da página anterior (a que acabou de
+    # ser processada, tenha ou não tido menção à FUNED) pra anexar como
+    # contexto em qualquer página que dê match. Isso resolve o caso de
+    # tabelas de licença (DEFERIDA/INDEFERIDA) que começam numa página e
+    # continuam na seguinte sem repetir o cabeçalho — sem esse contexto, não
+    # tinha como saber a categoria correta olhando só a página do match.
+    texto_pagina_anterior = ""
 
     for indice, pagina in enumerate(leitor.pages):
         numero_pagina = indice + 1
@@ -380,6 +387,7 @@ def extrair_publicacoes_pdf(
 
         if not texto:
             paginas_sem_texto.append(numero_pagina)
+            texto_pagina_anterior = ""
             continue
 
         texto_normalizado = normalizar_texto(texto)
@@ -396,8 +404,11 @@ def extrair_publicacoes_pdf(
                     "pagina": numero_pagina,
                     "termosEncontrados": termos_encontrados,
                     "textoPagina": texto,
+                    "textoPaginaAnterior": texto_pagina_anterior,
                 }
             )
+
+        texto_pagina_anterior = texto
 
     return {
         "totalPaginas": len(leitor.pages),
@@ -510,16 +521,6 @@ async def pesquisar_id_jornal_pela_interface(
 
         await pagina.wait_for_timeout(3_000)
 
-        # Campo de texto: usa rótulos e fallbacks para reduzir
-        # dependência de classes ou IDs internos do portal.
-        #
-        # IMPORTANTE: o portal tem um widget de acessibilidade (VLibras)
-        # cujo aria-label contém a palavra "Conteúdo", o que fazia esse
-        # get_by_label() resolver para aquele botão em vez do campo de
-        # busca de verdade (o botão não aceita texto, e o .fill() sempre
-        # falhava). Por isso exigimos, com .and_(), que o elemento
-        # encontrado seja necessariamente um <input> ou <textarea> — um
-        # <button> nunca vai satisfazer essa condição.
         campo_texto = pagina.locator("input, textarea").and_(
             pagina.get_by_label(
                 re.compile(
@@ -554,7 +555,6 @@ async def pesquisar_id_jornal_pela_interface(
         data_br = carga.data_publicacao.strftime("%d/%m/%Y")
         data_iso = carga.data_publicacao.isoformat()
 
-        # Primeiro tenta preencher pelos rótulos.
         data_inicial = pagina.get_by_label(
             re.compile(
                 r"data\s*inicial",
@@ -600,8 +600,6 @@ async def pesquisar_id_jornal_pela_interface(
                 detail="O campo Data Final não foi localizado no portal.",
             )
 
-        # Mantém o Diário do Executivo selecionado. Caso o portal
-        # use checkbox, garante o estado marcado.
         executivo = pagina.get_by_text(
             re.compile(
                 r"di[aá]rio do executivo",
@@ -623,8 +621,6 @@ async def pesquisar_id_jornal_pela_interface(
                 ):
                     await checkbox.check(force=True)
             except Exception:
-                # Alguns layouts usam botão visual, não checkbox.
-                # Nesse caso, preservamos o estado padrão do portal.
                 pass
 
         botao_pesquisar = pagina.get_by_role(
@@ -687,7 +683,6 @@ async def pesquisar_id_jornal_pela_interface(
                 },
             )
 
-        # O token efetivamente usado na pesquisa é a fonte de verdade.
         authorization_real = (
             resposta_pesquisa.request.headers.get(
                 "authorization"
@@ -788,7 +783,6 @@ async def pesquisar_id_jornal_pela_interface(
                 },
             )
 
-        # Prioriza o resultado que contém o termo pesquisado.
         termo = normalizar_texto(carga.texto_pesquisa)
 
         candidatos_com_id.sort(
@@ -1068,7 +1062,7 @@ async def raiz() -> dict[str, str]:
     return {
         "servico": "FUNED Diário Oficial",
         "status": "online",
-        "versao": "3.3.0",
+        "versao": "3.4.0",
     }
 
 
@@ -1076,7 +1070,7 @@ async def raiz() -> dict[str, str]:
 async def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "versao": "3.3.0",
+        "versao": "3.4.0",
     }
 
 
