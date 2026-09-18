@@ -199,6 +199,10 @@ def buscar_paginas_diario():
                 {
                     "numero": p.get("pagina"),
                     "texto": p.get("textoPagina") or "",
+                    # CORREÇÃO 18/09/2026: final da página anterior, usado
+                    # como contexto pra resolver tabelas de licença
+                    # (DEFERIDA/INDEFERIDA) que começam na página de trás.
+                    "texto_pagina_anterior": p.get("textoPaginaAnterior") or "",
                 }
                 for p in publicacoes_brutas
             ]
@@ -314,14 +318,42 @@ Regras importantes:
   começou. Se um item da FUNED aparecer LOGO NO INÍCIO do texto da página, ANTES de
   qualquer cabeçalho "DEFERIDA(S)"/"INDEFERIDA(S)" aparecer nesta página, significa que a
   tabela começou na página anterior e você NÃO tem como saber com certeza se é DEFERIDA ou
-  INDEFERIDA só com o texto desta página. Nesse caso, NÃO adivinhe: use
-  "tipo_do_ato": "Licença para tratamento de saúde (categoria DEFERIDA/INDEFERIDA não
-  visível nesta página — tabela iniciada na página anterior)".
+  INDEFERIDA só com o texto desta página.
+- Se um bloco "--- CONTEXTO: final da página anterior ---" for fornecido junto com o texto
+  desta página, use-o PRIMEIRO para tentar localizar o cabeçalho "DEFERIDA(S)" ou
+  "INDEFERIDA(S)" que se aplica ao item que começa logo no início desta página — ele pode
+  estar nesse bloco de contexto. Se encontrar o cabeçalho lá, preencha "tipo_do_ato"
+  normalmente com a categoria correta (não escreva mais "categoria não visível" se o
+  contexto já resolveu isso). Esse bloco de contexto serve SOMENTE pra essa desambiguação:
+  nunca crie uma publicação nova com base em conteúdo que apareça só nesse bloco — ele é de
+  outra página, não desta.
+- Se não houver bloco de contexto, ou se mesmo com ele não for possível determinar a
+  categoria com segurança, NÃO adivinhe: use "tipo_do_ato": "Licença para tratamento de
+  saúde (categoria DEFERIDA/INDEFERIDA não visível nesta página — tabela iniciada na página
+  anterior)".
 """
 
 
 def montar_prompt_usuario_pagina(pagina):
-    return f"--- PÁGINA {pagina['numero']} ---\n{pagina['texto']}"
+    # CORREÇÃO 18/09/2026: anexa o final da página anterior como um bloco de
+    # CONTEXTO separado, só pra resolver o cabeçalho DEFERIDA(S)/
+    # INDEFERIDA(S) de tabelas que começam nesta página sem repeti-lo. Manda
+    # só os últimos ~2000 caracteres da página anterior (o suficiente pra
+    # pegar esse tipo de cabeçalho, sem inflar o prompt com a página
+    # anterior inteira).
+    texto_anterior = pagina.get("texto_pagina_anterior") or ""
+    bloco_contexto = ""
+    if texto_anterior:
+        final_pagina_anterior = texto_anterior[-2000:]
+        bloco_contexto = (
+            "\n\n--- CONTEXTO: final da página anterior (SOMENTE para "
+            "ajudar a resolver a categoria DEFERIDA/INDEFERIDA de tabelas "
+            "que começam nesta página sem cabeçalho; NUNCA crie uma "
+            "publicação com base em conteúdo que apareça só neste bloco "
+            "de contexto — ele não pertence a esta página) ---\n"
+            f"{final_pagina_anterior}"
+        )
+    return f"--- PÁGINA {pagina['numero']} ---\n{pagina['texto']}{bloco_contexto}"
 
 
 def _fim_do_objeto(texto, inicio):
@@ -631,6 +663,66 @@ def _chamar_llm_para_pagina(pagina):
     raise RuntimeError(f"Falha ao extrair publicações da página {pagina['numero']} após {MAX_TENTATIVAS} tentativas: {ultimo_erro}")
 
 
+
+# CORREÇÃO 18/09/2026 (2ª rodada): em 18/09/2026, depois da correção do rate
+# limit, a página 19 passou a ser analisada — mas a IA atribuiu à FUNED um
+# indeferimento de pensão que, pela ordem real do texto da página, pertence
+# ao IPSEMG (Instituto de Previdência dos Servidores do Estado de MG), uma
+# autarquia diferente que só compartilha a página com a FUNED. O trecho de
+# "conteudo_oficial" dessa publicação não citava "FUNED"/"Fundação Ezequiel
+# Dias" em lugar nenhum. Por isso, valida-se aqui — não só no prompt — que
+# cada publicação realmente cita a FUNED dentro do próprio conteúdo oficial
+# extraído; quem não citar é descartada (silenciosamente, por pedido).
+TERMOS_ATRIBUICAO_FUNED = ["Fundação Ezequiel Dias", "FUNED", "Funed"]
+
+
+def _publicacao_atribuida_a_funed(pub):
+    """Confere se o trecho de 'conteudo_oficial' realmente cita a FUNED (por
+    nome completo ou sigla) em algum lugar dele — não basta a palavra ter
+    aparecido em outro ponto da página."""
+    conteudo_normalizado = _normalizar(pub.get("conteudo_oficial") or "")
+    if not conteudo_normalizado:
+        return False
+    termos = TERMOS_ATRIBUICAO_FUNED + [TEXTO_BUSCA]
+    return any(_normalizar(termo) in conteudo_normalizado for termo in termos if termo)
+
+
+def _processar_uma_pagina(pagina):
+    """Chama a IA para UMA página e devolve (publicacoes_validas, falhou).
+    Função auxiliar usada tanto na primeira passada quanto na rodada extra
+    de retentativas no final (ver extrair_publicacoes)."""
+    try:
+        resultado_pagina = _chamar_llm_para_pagina(pagina)
+    except Exception as e:  # noqa: BLE001
+        print(f"Falha ao analisar a página {pagina['numero']}: {e}", file=sys.stderr)
+        return [], True
+
+    publicacoes_pagina = resultado_pagina.get("publicacoes") or []
+    if not publicacoes_pagina:
+        return [], False
+
+    # Força o número da página com o valor que a GENTE já sabe (veio do
+    # serviço de raspagem), em vez de confiar no que o modelo eventualmente
+    # tenha tentado inventar/repetir — é exatamente isso que evita o bug de
+    # páginas trocadas entre publicações.
+    for pub in publicacoes_pagina:
+        pub["pagina"] = pagina["numero"]
+
+    publicacoes_validas = [
+        pub for pub in publicacoes_pagina if _publicacao_atribuida_a_funed(pub)
+    ]
+    descartadas = len(publicacoes_pagina) - len(publicacoes_validas)
+    if descartadas:
+        print(
+            f"[validação de atribuição] página {pagina['numero']}: descartada(s) "
+            f"{descartadas} publicação(ões) cujo conteúdo oficial não citava a FUNED "
+            f"(provável atribuição incorreta a outro órgão, ex: IPSEMG/DETRAN/Hemominas).",
+            file=sys.stderr,
+        )
+
+    return publicacoes_validas, False
+
+
 def extrair_publicacoes(paginas):
     """Analisa cada página separadamente (uma chamada à IA por página) e junta
     os resultados. Ver o comentário grande acima de PROMPT_SISTEMA pra
@@ -644,32 +736,52 @@ def extrair_publicacoes(paginas):
 
     for i, pagina in enumerate(paginas):
         print(f"Analisando página {pagina['numero']} com a IA ({i + 1}/{len(paginas)})...", file=sys.stderr)
-        try:
-            resultado_pagina = _chamar_llm_para_pagina(pagina)
-        except Exception as e:  # noqa: BLE001
-            # Se UMA página falhar (mesmo após as tentativas), não perde as
-            # outras — registra o erro, guarda o número da página como
-            # "falha" (pra entrar no aviso da rede de segurança lá embaixo)
-            # e segue pras próximas páginas.
-            print(f"Falha ao analisar a página {pagina['numero']}, pulando essa página: {e}", file=sys.stderr)
+        publicacoes_validas, falhou = _processar_uma_pagina(pagina)
+        if falhou:
             paginas_com_falha.append(pagina["numero"])
-            continue
-
-        publicacoes_pagina = resultado_pagina.get("publicacoes") or []
-        if publicacoes_pagina:
-            # Força o número da página com o valor que a GENTE já sabe (veio
-            # do serviço de raspagem), em vez de confiar no que o modelo
-            # eventualmente tenha tentado inventar/repetir — é exatamente
-            # isso que evita o bug de páginas trocadas entre publicações.
-            for pub in publicacoes_pagina:
-                pub["pagina"] = pagina["numero"]
-            todas_publicacoes.extend(publicacoes_pagina)
+        elif publicacoes_validas:
+            todas_publicacoes.extend(publicacoes_validas)
             paginas_com_atos.append(pagina["numero"])
 
-        # pequena pausa entre chamadas pra não estourar o limite de
-        # requisições por minuto do plano gratuito da OpenRouter.
+        # pausa entre chamadas pra não estourar o limite de requisições por
+        # minuto do plano gratuito da OpenRouter (aumentada de 3s pra 5s em
+        # 18/09/2026, já que 3s não bastou pra evitar 429 seguidos).
         if i < len(paginas) - 1:
-            time.sleep(3)
+            time.sleep(5)
+
+    # CORREÇÃO 18/09/2026 (3ª rodada): rodada extra, ao FINAL de tudo, só
+    # para as páginas que falharam por completo (ex: rate limit em todas as
+    # tentativas). Como o processo já gastou um tempo considerável
+    # processando as outras páginas, essa espera extra dá uma chance real do
+    # limite por minuto da OpenRouter ter resetado de vez — foi exatamente
+    # essa falta de uma segunda chance, mais tarde, que fez a página 19
+    # (Portaria FUNED nº 75/2026) sumir do e-mail de 18/09/2026.
+    if paginas_com_falha:
+        print(
+            f"Rodada extra ao final para {len(paginas_com_falha)} página(s) que "
+            f"falharam: {paginas_com_falha}. Aguardando 45s antes de retentar...",
+            file=sys.stderr,
+        )
+        time.sleep(45)
+        paginas_por_numero = {p["numero"]: p for p in paginas}
+        paginas_com_falha_definitiva = []
+        for numero in paginas_com_falha:
+            pagina = paginas_por_numero[numero]
+            print(f"Retentando página {numero} (rodada extra)...", file=sys.stderr)
+            publicacoes_validas, falhou = _processar_uma_pagina(pagina)
+            if falhou:
+                paginas_com_falha_definitiva.append(numero)
+            elif publicacoes_validas:
+                todas_publicacoes.extend(publicacoes_validas)
+                paginas_com_atos.append(numero)
+            time.sleep(8)
+        paginas_com_falha = paginas_com_falha_definitiva
+        if paginas_com_falha:
+            print(
+                f"Página(s) que falharam mesmo após a rodada extra: {paginas_com_falha}. "
+                f"Vão aparecer no aviso de verificação manual do e-mail.",
+                file=sys.stderr,
+            )
 
     resultado = {
         "paginas_com_atos": paginas_com_atos,
