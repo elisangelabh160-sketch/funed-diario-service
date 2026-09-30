@@ -900,11 +900,44 @@ def enviar_email(html, destinatarios):
     msg["To"] = ", ".join(destinatarios)
     msg.attach(MIMEText(html, "html", "utf-8"))
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as servidor:
-        servidor.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        servidor.sendmail(GMAIL_USER, destinatarios, msg.as_string())
+    # CORREÇÃO 30/09/2026: servidor.sendmail() NÃO levanta erro quando só
+    # PARTE dos destinatários é recusada pelo servidor de destino — ele só
+    # falha (SMTPRecipientsRefused) se TODOS forem recusados. Recusas
+    # parciais (endereço com problema, caixa cheia, filtro de spam do
+    # Exchange/Outlook do destinatário, etc.) eram, até agora, silenciosas:
+    # o código sempre imprimia "E-mail enviado para" a lista inteira, mesmo
+    # quando alguns nunca chegaram de fato (foi o que aconteceu em
+    # 30/09/2026 com dimitri.souza, dpgf e simone.silva). Agora capturamos o
+    # dicionário de recusados que o próprio sendmail() devolve e deixamos
+    # isso bem visível no log — e se TODOS os destinatários pretendidos
+    # falharem, nem uma tentativa "parcialmente aceita" real terá ocorrido,
+    # então isso também some pelo raise natural da biblioteca (ver except).
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as servidor:
+            servidor.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            recusados = servidor.sendmail(GMAIL_USER, destinatarios, msg.as_string())
+    except smtplib.SMTPRecipientsRefused as erro:
+        # Todos os destinatários foram recusados — nem um foi aceito.
+        print(
+            f"[ERRO] TODOS os destinatários foram recusados pelo servidor: "
+            f"{erro.recipients}",
+            file=sys.stderr,
+        )
+        raise
 
-    print(f"E-mail enviado para: {', '.join(destinatarios)}")
+    aceitos = [d for d in destinatarios if d not in recusados]
+    if aceitos:
+        print(f"E-mail enviado com sucesso para: {', '.join(aceitos)}")
+
+    if recusados:
+        print(
+            f"[ATENÇÃO] {len(recusados)} destinatário(s) RECUSADO(S) pelo servidor "
+            f"(e-mail NÃO chegou para ess{'es' if len(recusados) != 1 else 'e'}):",
+            file=sys.stderr,
+        )
+        for endereco, (codigo, motivo) in recusados.items():
+            motivo_str = motivo.decode("utf-8", errors="replace") if isinstance(motivo, bytes) else motivo
+            print(f"  -> {endereco}: código {codigo} — {motivo_str}", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------
