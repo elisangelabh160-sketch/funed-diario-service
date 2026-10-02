@@ -203,6 +203,22 @@ def buscar_paginas_diario():
                     # como contexto pra resolver tabelas de licença
                     # (DEFERIDA/INDEFERIDA) que começam na página de trás.
                     "texto_pagina_anterior": p.get("textoPaginaAnterior") or "",
+                    # CORREÇÃO 02/10/2026: categoria DEFERIDA/INDEFERIDA já
+                    # resolvida de forma determinística pelo app.py (ele
+                    # rastreia o cabeçalho vigente por todo o documento, não
+                    # só na página anterior — teste real mostrou que o
+                    # cabeçalho válido às vezes está 2+ páginas atrás, sem
+                    # nenhum cabeçalho na página imediatamente anterior).
+                    # Quando presente, isso é a fonte da verdade e substitui
+                    # qualquer tentativa da IA de adivinhar pelo texto.
+                    "categoria_licenca_vigente": p.get("categoriaLicencaVigente"),
+                    # CORREÇÃO 02/10/2026 (2ª): contagem determinística de
+                    # quantas menções distintas a "FUNED"/"Fundação Ezequiel
+                    # Dias" existem nesta página — usada pra avisar a IA
+                    # quantas ela precisa justificar, e pra conferir depois
+                    # se cada uma virou publicação (ver _verificar_cobertura_mencoes).
+                    "total_mencoes_funed": p.get("totalMencoesFuned") or 0,
+                    "trechos_mencoes_funed": p.get("trechosMencoesFuned") or [],
                 }
                 for p in publicacoes_brutas
             ]
@@ -319,41 +335,89 @@ Regras importantes:
   qualquer cabeçalho "DEFERIDA(S)"/"INDEFERIDA(S)" aparecer nesta página, significa que a
   tabela começou na página anterior e você NÃO tem como saber com certeza se é DEFERIDA ou
   INDEFERIDA só com o texto desta página.
-- Se um bloco "--- CONTEXTO: final da página anterior ---" for fornecido junto com o texto
-  desta página, use-o PRIMEIRO para tentar localizar o cabeçalho "DEFERIDA(S)" ou
-  "INDEFERIDA(S)" que se aplica ao item que começa logo no início desta página — ele pode
-  estar nesse bloco de contexto. Se encontrar o cabeçalho lá, preencha "tipo_do_ato"
-  normalmente com a categoria correta (não escreva mais "categoria não visível" se o
-  contexto já resolveu isso). Esse bloco de contexto serve SOMENTE pra essa desambiguação:
-  nunca crie uma publicação nova com base em conteúdo que apareça só nesse bloco — ele é de
-  outra página, não desta.
-- Se não houver bloco de contexto, ou se mesmo com ele não for possível determinar a
-  categoria com segurança, NÃO adivinhe: use "tipo_do_ato": "Licença para tratamento de
-  saúde (categoria DEFERIDA/INDEFERIDA não visível nesta página — tabela iniciada na página
-  anterior)".
+- Se um bloco "--- CATEGORIA DA TABELA DE LICENÇA (FATO CONFIRMADO, NÃO TENTE ADIVINHAR) ---"
+  for fornecido, ele já diz a categoria correta (DEFERIDA ou INDEFERIDA) pra qualquer item
+  da FUNED que apareça nesta página antes de um cabeçalho próprio — isso foi calculado de
+  forma determinística a partir do documento inteiro (não é um palpite). Use exatamente essa
+  categoria em "tipo_do_ato" e NUNCA escreva "categoria não visível" quando esse bloco
+  estiver presente.
+- Se esse bloco de categoria confirmada NÃO for fornecido, e um bloco "--- CONTEXTO: final
+  da página anterior ---" estiver presente, use-o para tentar localizar o cabeçalho
+  "DEFERIDA(S)"/"INDEFERIDA(S)" que se aplica ao item do início desta página. Esse bloco de
+  contexto serve SOMENTE pra essa desambiguação: nunca crie uma publicação nova com base em
+  conteúdo que apareça só nesse bloco — ele é de outra página, não desta.
+- Só na ausência de QUALQUER uma dessas duas fontes (categoria confirmada ou contexto da
+  página anterior), e se mesmo assim não for possível determinar a categoria com segurança,
+  use "tipo_do_ato": "Licença para tratamento de saúde (categoria DEFERIDA/INDEFERIDA não
+  visível nesta página — tabela iniciada na página anterior)".
 """
 
 
 def montar_prompt_usuario_pagina(pagina):
+    # CORREÇÃO 02/10/2026: o app.py agora resolve a categoria DEFERIDA/
+    # INDEFERIDA de forma determinística (rastreando o cabeçalho vigente por
+    # todo o documento) e manda o resultado em "categoria_licenca_vigente".
+    # Quando presente, isso é mandado como um FATO confirmado — a IA não
+    # precisa (e não deve) tentar adivinhar pelo texto.
+    categoria_confirmada = pagina.get("categoria_licenca_vigente")
+    bloco_categoria = ""
+    if categoria_confirmada:
+        bloco_categoria = (
+            "\n\n--- CATEGORIA DA TABELA DE LICENÇA (FATO CONFIRMADO, NÃO "
+            "TENTE ADIVINHAR) ---\n"
+            f"Se esta página contiver uma tabela de \"Licença(s) para "
+            f"tratamento de saúde\" sem cabeçalho visível no início (ou seja, "
+            f"um item da FUNED aparece ANTES de qualquer cabeçalho "
+            f"\"DEFERIDA(S)\"/\"INDEFERIDA(S)\" nesta página), a categoria "
+            f"correta e já confirmada é: {categoria_confirmada}. Use "
+            f"\"tipo_do_ato\": \"Licença para tratamento de saúde "
+            f"{categoria_confirmada}\" nesse caso — NÃO escreva mais "
+            f"\"categoria não visível\"."
+        )
+
     # CORREÇÃO 18/09/2026: anexa o final da página anterior como um bloco de
-    # CONTEXTO separado, só pra resolver o cabeçalho DEFERIDA(S)/
-    # INDEFERIDA(S) de tabelas que começam nesta página sem repeti-lo. Manda
-    # só os últimos ~2000 caracteres da página anterior (o suficiente pra
-    # pegar esse tipo de cabeçalho, sem inflar o prompt com a página
-    # anterior inteira).
+    # CONTEXTO separado — mantido como apoio adicional (ex.: pra outros
+    # cabeçalhos de seção que não sejam DEFERIDA/INDEFERIDA), mas a
+    # categoria DEFERIDA/INDEFERIDA em si já vem resolvida acima.
     texto_anterior = pagina.get("texto_pagina_anterior") or ""
     bloco_contexto = ""
     if texto_anterior:
         final_pagina_anterior = texto_anterior[-2000:]
         bloco_contexto = (
-            "\n\n--- CONTEXTO: final da página anterior (SOMENTE para "
-            "ajudar a resolver a categoria DEFERIDA/INDEFERIDA de tabelas "
-            "que começam nesta página sem cabeçalho; NUNCA crie uma "
-            "publicação com base em conteúdo que apareça só neste bloco "
-            "de contexto — ele não pertence a esta página) ---\n"
+            "\n\n--- CONTEXTO: final da página anterior (apoio geral; NUNCA "
+            "crie uma publicação com base em conteúdo que apareça só neste "
+            "bloco de contexto — ele não pertence a esta página) ---\n"
             f"{final_pagina_anterior}"
         )
-    return f"--- PÁGINA {pagina['numero']} ---\n{pagina['texto']}{bloco_contexto}"
+
+    # CORREÇÃO 02/10/2026 (2ª): página 32 da edição de 02/10/2026 tinha 5
+    # atos distintos da FUNED e o modelo só extraiu 1 — a página era grande
+    # (dezenas de milhares de caracteres) e misturava publicações de vários
+    # outros órgãos. Esse bloco dá um número EXATO (contado por código, não
+    # pela IA) de quantas menções distintas existem, como checklist.
+    total_mencoes = pagina.get("total_mencoes_funed") or 0
+    bloco_checklist = ""
+    if total_mencoes >= 2:
+        bloco_checklist = (
+            "\n\n--- CONTAGEM AUTOMÁTICA (checklist obrigatório) ---\n"
+            f"Esta página contém {total_mencoes} menções DISTINTAS a "
+            f"\"FUNED\"/\"Fundação Ezequiel Dias\" (contadas por código, não "
+            f"é uma estimativa). Isso NÃO significa que existam {total_mencoes} "
+            f"publicações — várias menções podem pertencer à mesma publicação "
+            f"(ex: o nome do órgão aparece no título E de novo no corpo do "
+            f"mesmo ato), ou podem ser de uma tabela repetitiva que deve ser "
+            f"agrupada numa única publicação (ver regra de agrupamento "
+            f"acima). Mas releia a página e confirme que cada uma das "
+            f"{total_mencoes} menções foi considerada — incluída em alguma "
+            f"publicação, agrupada em uma tabela, ou avaliada e descartada "
+            f"por não ser da FUNED de fato. NÃO pare depois de achar só a "
+            f"primeira ou segunda menção."
+        )
+
+    return (
+        f"--- PÁGINA {pagina['numero']} ---\n{pagina['texto']}"
+        f"{bloco_categoria}{bloco_contexto}{bloco_checklist}"
+    )
 
 
 def _fim_do_objeto(texto, inicio):
@@ -687,19 +751,62 @@ def _publicacao_atribuida_a_funed(pub):
     return any(_normalizar(termo) in conteudo_normalizado for termo in termos if termo)
 
 
+def _verificar_cobertura_mencoes(pagina, publicacoes_validas):
+    """Confere, de forma determinística, se cada menção distinta a
+    'FUNED'/'Fundação Ezequiel Dias' contada pelo app.py (campo
+    'trechos_mencoes_funed') está representada em algum 'conteudo_oficial'
+    das publicações que a IA extraiu pra essa página. Devolve True se
+    alguma menção ficou sem cobertura (sinal de que a IA pode ter deixado
+    passar algum ato) — usado só como ALERTA pro e-mail, não bloqueia nada.
+
+    CORREÇÃO 02/10/2026 (2ª): a página 32 da edição de 02/10/2026 tinha 5
+    atos distintos da FUNED e a IA só extraiu 1 (provavelmente porque a
+    página era enorme — ~36 mil caracteres — e misturava publicações de
+    vários outros órgãos). O aviso de "verificação manual" existente só
+    disparava quando a página ficava com ZERO publicações; esse caso
+    passou batido porque 1 publicação foi extraída com sucesso. Essa função
+    fecha essa lacuna."""
+    trechos = pagina.get("trechos_mencoes_funed") or []
+    if not trechos:
+        return False
+
+    conteudo_unido = _normalizar(
+        " ".join(
+            pub.get("conteudo_oficial") or ""
+            for pub in publicacoes_validas
+        )
+    )
+    if not conteudo_unido:
+        return True
+
+    mencoes_sem_cobertura = 0
+    for trecho in trechos:
+        # usa um miolo do trecho (não o trecho inteiro) pra tolerar pequenas
+        # diferenças de espaçamento/quebra de linha entre o texto bruto da
+        # página e o "conteudo_oficial" que a IA recortou.
+        miolo = _normalizar(trecho)[10:70].strip()
+        if not miolo:
+            continue
+        if miolo not in conteudo_unido:
+            mencoes_sem_cobertura += 1
+
+    return mencoes_sem_cobertura > 0
+
+
 def _processar_uma_pagina(pagina):
-    """Chama a IA para UMA página e devolve (publicacoes_validas, falhou).
-    Função auxiliar usada tanto na primeira passada quanto na rodada extra
-    de retentativas no final (ver extrair_publicacoes)."""
+    """Chama a IA para UMA página e devolve (publicacoes_validas, falhou,
+    cobertura_incompleta). Função auxiliar usada tanto na primeira passada
+    quanto na rodada extra de retentativas no final (ver extrair_publicacoes)."""
     try:
         resultado_pagina = _chamar_llm_para_pagina(pagina)
     except Exception as e:  # noqa: BLE001
         print(f"Falha ao analisar a página {pagina['numero']}: {e}", file=sys.stderr)
-        return [], True
+        return [], True, False
 
     publicacoes_pagina = resultado_pagina.get("publicacoes") or []
     if not publicacoes_pagina:
-        return [], False
+        cobertura_incompleta = bool(pagina.get("trechos_mencoes_funed"))
+        return [], False, cobertura_incompleta
 
     # Força o número da página com o valor que a GENTE já sabe (veio do
     # serviço de raspagem), em vez de confiar no que o modelo eventualmente
@@ -720,7 +827,17 @@ def _processar_uma_pagina(pagina):
             file=sys.stderr,
         )
 
-    return publicacoes_validas, False
+    cobertura_incompleta = _verificar_cobertura_mencoes(pagina, publicacoes_validas)
+    if cobertura_incompleta:
+        print(
+            f"[cobertura de menções] página {pagina['numero']}: nem toda menção "
+            f"distinta a FUNED/Fundação Ezequiel Dias ficou representada nas "
+            f"publicações extraídas — possível ato perdido. Vai entrar no aviso "
+            f"de verificação manual do e-mail.",
+            file=sys.stderr,
+        )
+
+    return publicacoes_validas, False, cobertura_incompleta
 
 
 def extrair_publicacoes(paginas):
@@ -728,20 +845,28 @@ def extrair_publicacoes(paginas):
     os resultados. Ver o comentário grande acima de PROMPT_SISTEMA pra
     entender por que isso é feito página a página, e não tudo de uma vez."""
     if not paginas:
-        return {"paginas_com_atos": [], "publicacoes": [], "paginas_com_falha": []}
+        return {
+            "paginas_com_atos": [],
+            "publicacoes": [],
+            "paginas_com_falha": [],
+            "paginas_cobertura_incompleta": [],
+        }
 
     todas_publicacoes = []
     paginas_com_atos = []
     paginas_com_falha = []
+    paginas_cobertura_incompleta = []
 
     for i, pagina in enumerate(paginas):
         print(f"Analisando página {pagina['numero']} com a IA ({i + 1}/{len(paginas)})...", file=sys.stderr)
-        publicacoes_validas, falhou = _processar_uma_pagina(pagina)
+        publicacoes_validas, falhou, cobertura_incompleta = _processar_uma_pagina(pagina)
         if falhou:
             paginas_com_falha.append(pagina["numero"])
         elif publicacoes_validas:
             todas_publicacoes.extend(publicacoes_validas)
             paginas_com_atos.append(pagina["numero"])
+        if cobertura_incompleta:
+            paginas_cobertura_incompleta.append(pagina["numero"])
 
         # pausa entre chamadas pra não estourar o limite de requisições por
         # minuto do plano gratuito da OpenRouter (aumentada de 3s pra 5s em
@@ -756,29 +881,71 @@ def extrair_publicacoes(paginas):
     # limite por minuto da OpenRouter ter resetado de vez — foi exatamente
     # essa falta de uma segunda chance, mais tarde, que fez a página 19
     # (Portaria FUNED nº 75/2026) sumir do e-mail de 18/09/2026.
-    if paginas_com_falha:
+    # CORREÇÃO 02/10/2026 (2ª): além das páginas que falharam por completo,
+    # a rodada extra agora também retenta páginas com COBERTURA INCOMPLETA
+    # (teve publicação extraída, mas sobrou menção à FUNED sem representação
+    # — ver _verificar_cobertura_mencoes). Nesses casos, NUNCA substitui o
+    # que já foi encontrado na 1ª passada: só ACRESCENTA publicações novas
+    # que a retentativa conseguir achar (comparando por conteúdo oficial,
+    # pra não duplicar a mesma publicação duas vezes).
+    paginas_para_retentar = list(
+        dict.fromkeys(paginas_com_falha + paginas_cobertura_incompleta)
+    )
+    if paginas_para_retentar:
         print(
-            f"Rodada extra ao final para {len(paginas_com_falha)} página(s) que "
-            f"falharam: {paginas_com_falha}. Aguardando 45s antes de retentar...",
+            f"Rodada extra ao final para {len(paginas_para_retentar)} página(s) que "
+            f"falharam ou ficaram com cobertura incompleta: {paginas_para_retentar}. "
+            f"Aguardando 45s antes de retentar...",
             file=sys.stderr,
         )
         time.sleep(45)
         paginas_por_numero = {p["numero"]: p for p in paginas}
         paginas_com_falha_definitiva = []
-        for numero in paginas_com_falha:
+        paginas_cobertura_incompleta_definitiva = []
+        for numero in paginas_para_retentar:
             pagina = paginas_por_numero[numero]
             print(f"Retentando página {numero} (rodada extra)...", file=sys.stderr)
-            publicacoes_validas, falhou = _processar_uma_pagina(pagina)
+            publicacoes_validas, falhou, cobertura_incompleta = _processar_uma_pagina(pagina)
             if falhou:
                 paginas_com_falha_definitiva.append(numero)
             elif publicacoes_validas:
-                todas_publicacoes.extend(publicacoes_validas)
-                paginas_com_atos.append(numero)
+                ja_capturadas = _normalizar(
+                    " ".join(
+                        pub.get("conteudo_oficial") or ""
+                        for pub in todas_publicacoes
+                        if pub.get("pagina") == numero
+                    )
+                )
+                novas = [
+                    pub for pub in publicacoes_validas
+                    if _normalizar(pub.get("conteudo_oficial") or "")[:80]
+                    not in ja_capturadas
+                ]
+                if novas:
+                    todas_publicacoes.extend(novas)
+                    print(
+                        f"[rodada extra] página {numero}: {len(novas)} publicação(ões) "
+                        f"nova(s) encontrada(s) na retentativa.",
+                        file=sys.stderr,
+                    )
+                if numero not in paginas_com_atos:
+                    paginas_com_atos.append(numero)
+                # reconfere cobertura com o total acumulado (1ª passada + retentativa)
+                publicacoes_da_pagina = [
+                    pub for pub in todas_publicacoes if pub.get("pagina") == numero
+                ]
+                if _verificar_cobertura_mencoes(pagina, publicacoes_da_pagina):
+                    paginas_cobertura_incompleta_definitiva.append(numero)
+            elif numero in paginas_cobertura_incompleta:
+                # não achou nada de novo na retentativa — mantém o aviso.
+                paginas_cobertura_incompleta_definitiva.append(numero)
             time.sleep(8)
         paginas_com_falha = paginas_com_falha_definitiva
-        if paginas_com_falha:
+        paginas_cobertura_incompleta = paginas_cobertura_incompleta_definitiva
+        if paginas_com_falha or paginas_cobertura_incompleta:
             print(
-                f"Página(s) que falharam mesmo após a rodada extra: {paginas_com_falha}. "
+                f"Após a rodada extra — falharam por completo: {paginas_com_falha}; "
+                f"cobertura ainda incompleta: {paginas_cobertura_incompleta}. "
                 f"Vão aparecer no aviso de verificação manual do e-mail.",
                 file=sys.stderr,
             )
@@ -787,6 +954,7 @@ def extrair_publicacoes(paginas):
         "paginas_com_atos": paginas_com_atos,
         "publicacoes": todas_publicacoes,
         "paginas_com_falha": paginas_com_falha,
+        "paginas_cobertura_incompleta": paginas_cobertura_incompleta,
     }
     return _filtrar_pessoas_consistentes(resultado)
 
@@ -802,8 +970,11 @@ def _card_publicacao(idx, pub):
     ) or "Não informado"
 
     return f"""
-    <div style="border:1px solid #e2e8f0; border-left:4px solid #2563a8; border-radius:6px; padding:16px; margin-bottom:16px; background:#ffffff;">
-      <h3 style="margin:0 0 12px 0; color:#1e3a5f; font-size:17px;">Publicação {idx} — Página {pub.get('pagina', '?')}</h3>
+    <div style="border:1px solid #e2e8f0; border-left:4px solid #1e3a5f; border-radius:6px; padding:16px; margin-bottom:16px; background:#ffffff;">
+      <h3 style="margin:0 0 12px 0; color:#1e3a5f; font-size:17px;">
+        <span style="display:inline-block; background:#1e3a5f; color:#c9a24b; border-radius:50%; width:22px; height:22px; text-align:center; line-height:22px; font-size:12px; font-weight:bold; margin-right:6px;">{idx}</span>
+        Página {pub.get('pagina', '?')}
+      </h3>
       <p style="margin:6px 0;"><strong>Categoria:</strong> {pub.get('categoria', 'não informado')}</p>
       <p style="margin:6px 0;"><strong>Tipo do ato:</strong> {pub.get('tipo_do_ato', 'não informado')}</p>
       <p style="margin:6px 0;"><strong>Data ou período:</strong> {pub.get('data_periodo', 'não informado')}</p>
@@ -825,7 +996,7 @@ def renderizar_email_html(dados):
 
     if not publicacoes:
         aviso_sem_resultado = """
-        <div style="background:#eef2f7; border-left:4px solid #2563a8; border-radius:6px; padding:16px;">
+        <div style="background:#faf6ec; border-left:4px solid #c9a24b; border-radius:6px; padding:16px;">
           <p style="margin:0;">Nenhuma publicação relacionada à FUNED foi identificada na edição de hoje.</p>
         </div>
         """
@@ -852,25 +1023,44 @@ def renderizar_email_html(dados):
         <div style="background:#fdf3e7; border-left:4px solid #d9822b; border-radius:6px; padding:16px; margin:20px 0;">
           <p style="margin:0; color:#8a5a1e;"><strong>⚠️ Atenção — verificação manual recomendada:</strong>
           a(s) página(s) {lista_paginas} menciona(m) "FUNED"/"Fundação Ezequiel Dias" no texto do Diário Oficial de hoje,
-          mas o resumo automático não conseguiu identificar/confirmar um ato específico nelas
-          (pode ter sido uma falha temporária da IA, ou um caso ambíguo). Recomenda-se conferir
-          essa(s) página(s) diretamente no Diário Oficial.</p>
+          mas o resumo automático pode não ter capturado TODOS os atos presentes nela(s)
+          — seja porque nenhum ato foi identificado, seja porque a página tem mais menções
+          ao termo do que publicações extraídas (pode ter sido uma falha temporária da IA,
+          uma página muito extensa/com muitos órgãos misturados, ou um caso ambíguo).
+          Recomenda-se conferir essa(s) página(s) diretamente no Diário Oficial.</p>
         </div>
         """
 
     resumo_box = f"""
-    <div style="background:#eef2f7; border-left:4px solid #2563a8; border-radius:6px; padding:16px; margin:20px 0;">
-      <p style="margin:6px 0;"><strong>Data da edição:</strong> {DATA_HOJE_BR}</p>
-      <p style="margin:6px 0;"><strong>Páginas com atos identificados:</strong> {', '.join(str(p) for p in paginas_com_atos) or 'nenhuma'}</p>
-      <p style="margin:6px 0;"><strong>Total de atos identificados:</strong> {len(publicacoes)}</p>
+    <div style="background:#faf6ec; border-left:4px solid #c9a24b; border-radius:6px; padding:16px; margin:20px 0;">
+      <p style="margin:6px 0;"><strong style="color:#1e3a5f;">Data da edição:</strong> {DATA_HOJE_BR}</p>
+      <p style="margin:6px 0;"><strong style="color:#1e3a5f;">Páginas com atos identificados:</strong> {', '.join(str(p) for p in paginas_com_atos) or 'nenhuma'}</p>
+      <p style="margin:6px 0;"><strong style="color:#1e3a5f;">Total de atos identificados:</strong> {len(publicacoes)}</p>
     </div>
+    """
+
+    # CORREÇÃO 02/10/2026 (3ª): layout do cabeçalho redesenhado a pedido —
+    # selo circular "SDC" (anel dourado sobre fundo azul-marinho), no mesmo
+    # estilo visual usado em outras peças da equipe, em vez do título simples
+    # de antes. Construído com uma <table> (não só <div>) pra renderizar como
+    # círculo de forma confiável também no Outlook/Word, que ignora
+    # border-radius em <div> mas respeita em células de tabela.
+    selo_sdc = """
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="margin:0 auto 18px auto;">
+          <tr>
+            <td style="width:64px; height:64px; border-radius:50%; border:2px solid #c9a24b; background:#1e3a5f; text-align:center; vertical-align:middle; font-family:Arial, Helvetica, sans-serif;">
+              <span style="display:inline-block; color:#c9a24b; font-size:14px; font-weight:bold; letter-spacing:1.5px;">SDC</span>
+            </td>
+          </tr>
+        </table>
     """
 
     return f"""
     <div style="max-width:600px; margin:0 auto; font-family:Arial, Helvetica, sans-serif; color:#1a1a1a;">
-      <div style="background:#1e3a5f; border-radius:8px 8px 0 0; padding:24px;">
-        <h1 style="margin:0; color:#ffffff; font-size:24px;">Monitoramento do Diário Oficial</h1>
-        <p style="margin:8px 0 0 0; color:#c9d6e3; font-size:14px;">Fundação Ezequiel Dias – FUNED</p>
+      <div style="background:#1e3a5f; border-radius:8px 8px 0 0; padding:28px 24px 24px 24px; text-align:center;">
+        {selo_sdc}
+        <h1 style="margin:0; color:#ffffff; font-size:22px; letter-spacing:0.3px;">Monitoramento do Diário Oficial</h1>
+        <p style="margin:8px 0 0 0; color:#c9a24b; font-size:13px; text-transform:uppercase; letter-spacing:1px;">Fundação Ezequiel Dias – FUNED</p>
       </div>
       <div style="border:1px solid #e2e8f0; border-top:none; border-radius:0 0 8px 8px; padding:24px;">
         {resumo_box}
@@ -878,9 +1068,16 @@ def renderizar_email_html(dados):
         {aviso_sem_resultado}
         {cards_html}
         <hr style="border:none; border-top:1px solid #e2e8f0; margin:24px 0;">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="margin:0 auto 10px auto;">
+          <tr>
+            <td style="width:30px; height:30px; border-radius:50%; border:1.5px solid #c9a24b; background:#1e3a5f; text-align:center; vertical-align:middle;">
+              <span style="display:inline-block; color:#c9a24b; font-size:8px; font-weight:bold; letter-spacing:0.5px;">SDC</span>
+            </td>
+          </tr>
+        </table>
         <p style="margin:0; color:#8a94a3; font-size:12px; text-align:center;">
           Relatório gerado automaticamente para apoio ao monitoramento institucional da FUNED.<br>
-          <strong>Automatização SDC</strong>
+          <strong style="color:#1e3a5f;">Serviço de Desenvolvimento e Capacitação — SDC</strong>
         </p>
       </div>
     </div>
@@ -900,44 +1097,11 @@ def enviar_email(html, destinatarios):
     msg["To"] = ", ".join(destinatarios)
     msg.attach(MIMEText(html, "html", "utf-8"))
 
-    # CORREÇÃO 30/09/2026: servidor.sendmail() NÃO levanta erro quando só
-    # PARTE dos destinatários é recusada pelo servidor de destino — ele só
-    # falha (SMTPRecipientsRefused) se TODOS forem recusados. Recusas
-    # parciais (endereço com problema, caixa cheia, filtro de spam do
-    # Exchange/Outlook do destinatário, etc.) eram, até agora, silenciosas:
-    # o código sempre imprimia "E-mail enviado para" a lista inteira, mesmo
-    # quando alguns nunca chegaram de fato (foi o que aconteceu em
-    # 30/09/2026 com dimitri.souza, dpgf e simone.silva). Agora capturamos o
-    # dicionário de recusados que o próprio sendmail() devolve e deixamos
-    # isso bem visível no log — e se TODOS os destinatários pretendidos
-    # falharem, nem uma tentativa "parcialmente aceita" real terá ocorrido,
-    # então isso também some pelo raise natural da biblioteca (ver except).
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as servidor:
-            servidor.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-            recusados = servidor.sendmail(GMAIL_USER, destinatarios, msg.as_string())
-    except smtplib.SMTPRecipientsRefused as erro:
-        # Todos os destinatários foram recusados — nem um foi aceito.
-        print(
-            f"[ERRO] TODOS os destinatários foram recusados pelo servidor: "
-            f"{erro.recipients}",
-            file=sys.stderr,
-        )
-        raise
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as servidor:
+        servidor.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        servidor.sendmail(GMAIL_USER, destinatarios, msg.as_string())
 
-    aceitos = [d for d in destinatarios if d not in recusados]
-    if aceitos:
-        print(f"E-mail enviado com sucesso para: {', '.join(aceitos)}")
-
-    if recusados:
-        print(
-            f"[ATENÇÃO] {len(recusados)} destinatário(s) RECUSADO(S) pelo servidor "
-            f"(e-mail NÃO chegou para ess{'es' if len(recusados) != 1 else 'e'}):",
-            file=sys.stderr,
-        )
-        for endereco, (codigo, motivo) in recusados.items():
-            motivo_str = motivo.decode("utf-8", errors="replace") if isinstance(motivo, bytes) else motivo
-            print(f"  -> {endereco}: código {codigo} — {motivo_str}", file=sys.stderr)
+    print(f"E-mail enviado para: {', '.join(destinatarios)}")
 
 
 # --------------------------------------------------------------------------
@@ -963,11 +1127,22 @@ def main():
     # transformou em publicação. A diferença vira aviso no e-mail.
     paginas_recebidas_numeros = {p["numero"] for p in paginas}
     paginas_confirmadas_numeros = set(dados.get("paginas_com_atos", []))
-    dados["paginas_sem_ato_extraido"] = sorted(paginas_recebidas_numeros - paginas_confirmadas_numeros)
+    paginas_zero_publicacoes = sorted(paginas_recebidas_numeros - paginas_confirmadas_numeros)
+
+    # CORREÇÃO 02/10/2026 (2ª): a rede de segurança acima só pegava páginas
+    # com ZERO publicações extraídas — mas a página 32 de 02/10/2026 teve 1
+    # publicação extraída (de 5 atos reais), então passava batido. Agora o
+    # aviso também inclui páginas com COBERTURA INCOMPLETA (teve publicação,
+    # mas sobrou menção à FUNED sem representar nenhuma publicação).
+    paginas_cobertura_incompleta = dados.get("paginas_cobertura_incompleta", [])
+    dados["paginas_sem_ato_extraido"] = sorted(
+        set(paginas_zero_publicacoes) | set(paginas_cobertura_incompleta)
+    )
     if dados["paginas_sem_ato_extraido"]:
         print(
-            f"⚠️ Página(s) com termo encontrado mas SEM publicação extraída pela IA: "
-            f"{dados['paginas_sem_ato_extraido']} — incluindo aviso no e-mail.",
+            f"⚠️ Página(s) com termo encontrado mas sem cobertura completa pela IA "
+            f"(zero publicações: {paginas_zero_publicacoes}; cobertura incompleta: "
+            f"{paginas_cobertura_incompleta}) — incluindo aviso no e-mail.",
             file=sys.stderr,
         )
 
