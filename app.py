@@ -27,6 +27,37 @@ from pypdf import PdfReader
 PORTAL = "https://www.jornalminasgerais.mg.gov.br"
 SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "").strip()
 
+
+# CORREÇÃO 02/10/2026 (5ª): monta o link público da edição no portal, pro
+# e-mail poder linkar direto pra lá em vez de só citar o número da página.
+# Formato decodificado a partir de um link real que a própria Elisangela
+# colou (aberto por ela no navegador, então confirmado funcional):
+#   .../edicao-do-dia?dados={"cronogramas":{"<data>":[0]},
+#       "idCadernoEdicaoSelecionado":<id>,
+#       "edicaoSelecionada":{"id":<id>,"descricao":"Diário do Executivo","ordem":100},
+#       "dataPublicacaoSelecionada":"<data>T03:00:00.000Z"}
+# O "id" é o mesmo "idJornal" que este serviço já usa pra buscar o PDF via
+# ObterEdicaoPorId. O portal usa encodeURI() do JavaScript pra montar esse
+# parâmetro — por isso ":" e "," ficam sem converter para %3A/%2C (replicado
+# abaixo com safe=":,", testado batendo caractere a caractere com o link
+# real). IMPORTANTE: esse link abre a EDIÇÃO DO DIA inteira no visualizador
+# do portal — a URL não tem um parâmetro de página específica, então não dá
+# pra pular direto pra uma página; a pessoa ainda precisa navegar até a
+# página indicada dentro do visualizador.
+def montar_link_edicao(id_jornal: int, data_publicacao_iso: str) -> str:
+    dados = {
+        "cronogramas": {data_publicacao_iso: [0]},
+        "idCadernoEdicaoSelecionado": id_jornal,
+        "edicaoSelecionada": {
+            "id": id_jornal,
+            "descricao": "Diário do Executivo",
+            "ordem": 100,
+        },
+        "dataPublicacaoSelecionada": f"{data_publicacao_iso}T03:00:00.000Z",
+    }
+    dados_json = json.dumps(dados, ensure_ascii=False, separators=(",", ":"))
+    return f"{PORTAL}/edicao-do-dia?dados=" + quote(dados_json, safe=":,")
+
 # CORREÇÃO 02/10/2026: as tabelas de "Licenças para tratamento de saúde
 # DEFERIDAS/INDEFERIDAS" são organizadas em blocos que ficam valendo até o
 # próximo cabeçalho aparecer — e esse cabeçalho pode estar MUITO antes da
@@ -1031,6 +1062,9 @@ async def processar_edicao(
             "textoPesquisa": carga.texto_pesquisa,
             "resultadoPesquisa": resultado_pesquisa,
             "cadernos": cadernos,
+            "linkEdicao": montar_link_edicao(
+                id_jornal, carga.data_publicacao.isoformat()
+            ),
             **resultado,
             "diagnosticoArquivo": diagnostico,
         },
