@@ -79,13 +79,56 @@ def _agrupar_mencoes_funed(texto: str, raio_cluster: int = 80) -> list[str]:
         for pos in grupos
     ]
 
+
+# CORREÇÃO 02/10/2026 (4ª): além de avisar quantas menções existem, agora
+# recortamos o texto mandado pra IA pra conter só os trechos ao redor de
+# cada menção à FUNED, com uma margem generosa — em vez da página inteira.
+# A página 32 tinha ~36 mil caracteres, a maior parte publicações de OUTROS
+# órgãos (SES, CIB-SUS/MG) sem nenhuma relação com a FUNED; pedir pro modelo
+# vasculhar tudo isso pra achar 5 atos espalhados é "agulha no palheiro" —
+# tirando o que não interessa, o modelo tem bem menos pra ler E bem menos
+# pra "confundir", o que deve ajudar tanto a achar todos os atos quanto a
+# gastar menos tokens de resposta (reduzindo risco de estourar o limite).
+# Raio calibrado (3500) testando contra a edição real de 02/10/2026: o texto
+# extraído da página é em colunas que a extração intercala, então o trecho
+# que CONFIRMA a FUNED (ex: a assinatura "Chefe de Gestão de Pessoas da
+# Fundação Ezequiel Dias") pode ficar a 3-3,5 mil caracteres de distância do
+# início do próprio ato, não logo ao lado — um raio menor (ex: 1500) cortava
+# justamente esse trecho de confirmação em pelo menos um caso real testado.
+def _extrair_trecho_relevante(texto: str, raio: int = 3500) -> str:
+    posicoes = [m.start() for m in RE_MENCAO_FUNED.finditer(texto)]
+    if not posicoes:
+        return texto
+
+    janelas: list[list[int]] = []
+    for pos in posicoes:
+        inicio = max(0, pos - raio)
+        fim = min(len(texto), pos + raio)
+        if janelas and inicio <= janelas[-1][1] + 300:
+            # janela próxima/sobreposta à anterior: funde numa só, em vez de
+            # criar um recorte separado logo colado no outro.
+            janelas[-1][1] = max(janelas[-1][1], fim)
+        else:
+            janelas.append([inicio, fim])
+
+    # Se os recortes já cobrem quase a página inteira, não vale a pena —
+    # o ganho seria pequeno e só arrisca cortar algo por engano.
+    total_coberto = sum(fim - inicio for inicio, fim in janelas)
+    if total_coberto >= len(texto) * 0.75:
+        return texto
+
+    return "\n\n[... trecho desta página sem menção à FUNED, omitido ...]\n\n".join(
+        texto[inicio:fim] for inicio, fim in janelas
+    )
+
+
 MAX_TENTATIVAS_MONITORAMENTO = 4
 ESPERAS_MONITORAMENTO_SEGUNDOS = [5, 10, 20]
 STATUS_REPETIVEIS = {401, 408, 429, 500, 502, 503, 504}
 
 app = FastAPI(
     title="FUNED Diário Oficial Service",
-    version="3.6.0",
+    version="3.7.0",
 )
 
 
@@ -491,11 +534,18 @@ def extrair_publicacoes_pdf(
 
             trechos_mencoes = _agrupar_mencoes_funed(texto)
 
+            # CORREÇÃO 02/10/2026 (4ª): "textoPagina" (o que vai pro prompt da
+            # IA) agora é o texto RECORTADO ao redor das menções à FUNED, não
+            # a página inteira — tudo o que é determinístico (categoria de
+            # licença, contagem de menções) já foi calculado em cima do texto
+            # COMPLETO acima, então recortar aqui não afeta essas checagens.
+            texto_para_ia = _extrair_trecho_relevante(texto)
+
             publicacoes.append(
                 {
                     "pagina": numero_pagina,
                     "termosEncontrados": termos_encontrados,
-                    "textoPagina": texto,
+                    "textoPagina": texto_para_ia,
                     "textoPaginaAnterior": texto_pagina_anterior,
                     "categoriaLicencaVigente": categoria_nesta_pagina,
                     "totalMencoesFuned": len(trechos_mencoes),
@@ -1165,7 +1215,7 @@ async def raiz() -> dict[str, str]:
     return {
         "servico": "FUNED Diário Oficial",
         "status": "online",
-        "versao": "3.6.0",
+        "versao": "3.7.0",
     }
 
 
@@ -1173,7 +1223,7 @@ async def raiz() -> dict[str, str]:
 async def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "versao": "3.6.0",
+        "versao": "3.7.0",
     }
 
 
