@@ -654,10 +654,12 @@ def _chamar_llm_para_pagina(pagina):
             {"role": "user", "content": montar_prompt_usuario_pagina(pagina)},
         ],
         "temperature": 0.1,
-        # Como agora é só uma página por chamada, a resposta tende a ser bem
-        # menor que antes — mas deixamos uma folga generosa pra páginas com
-        # tabelas grandes da FUNED (esse modelo aceita até 32768).
-        "max_tokens": 16000,
+        # CORREÇÃO 02/10/2026 (4ª): aumentado de 16000 pra 24000 como reforço
+        # extra contra resposta cortada no meio em páginas com muitos atos da
+        # FUNED (esse modelo aceita até 32768) — além do recorte de texto por
+        # menção (ver _extrair_trecho_relevante no app.py), que já reduz bastante
+        # o que precisa ser processado/gerado por página.
+        "max_tokens": 24000,
         "response_format": {"type": "json_object"},
         # Caso o modelo escolhido tenha uma etapa de "raciocínio" opcional,
         # isso pede pra ele não gastar tokens de resposta com isso. Modelos
@@ -973,7 +975,7 @@ def _card_publicacao(idx, pub):
     ) or "Não informado"
 
     return f"""
-    <div style="border:1px solid #e2e8f0; border-left:4px solid #7a1626; border-radius:6px; padding:16px; margin-bottom:16px; background:#ffffff;">
+    <div style="border:1px solid #e2e8f0; border-left:4px solid #7a1626; border-radius:6px; padding:16px; margin-bottom:16px; background:#f4f4f5;">
       <h3 style="margin:0 0 12px 0; color:#7a1626; font-size:17px;">
         <span style="display:inline-block; background:#7a1626; color:#e3e4e6; border-radius:50%; width:22px; height:22px; text-align:center; line-height:22px; font-size:12px; font-weight:bold; margin-right:6px;">{idx}</span>
         Página {pub.get('pagina', '?')}
@@ -1061,7 +1063,7 @@ def renderizar_email_html(dados):
         <h1 style="margin:0; color:#ffffff; font-size:22px; letter-spacing:0.3px;">Monitoramento do Diário Oficial</h1>
         <p style="margin:8px 0 0 0; color:#d4d5d7; font-size:13px; text-transform:uppercase; letter-spacing:1px;">Fundação Ezequiel Dias – FUNED</p>
       </div>
-      <div style="border:1px solid #e2e8f0; border-top:none; border-radius:0 0 8px 8px; padding:24px;">
+      <div style="border:1px solid #e2e8f0; border-top:none; border-radius:0 0 8px 8px; padding:24px; background:#ffffff;">
         {resumo_box}
         {aviso_paginas_nao_confirmadas}
         {aviso_sem_resultado}
