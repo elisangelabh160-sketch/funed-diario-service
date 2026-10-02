@@ -27,13 +27,65 @@ from pypdf import PdfReader
 PORTAL = "https://www.jornalminasgerais.mg.gov.br"
 SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "").strip()
 
+# CORREÇÃO 02/10/2026: as tabelas de "Licenças para tratamento de saúde
+# DEFERIDAS/INDEFERIDAS" são organizadas em blocos que ficam valendo até o
+# próximo cabeçalho aparecer — e esse cabeçalho pode estar MUITO antes da
+# página atual (o teste real mostrou um caso em que a página imediatamente
+# anterior não tinha cabeçalho NENHUM, e o cabeçalho que realmente valia
+# estava 2 páginas atrás). Por isso o contexto de "só a página anterior" não
+# é suficiente — precisa de um estado que atravesse o documento inteiro.
+RE_CATEGORIA_LICENCA = re.compile(
+    r"Licenç(?:a|as)\s+para\s+tratamento\s+de\s+sa[úu]de\s+(DEFERIDA|INDEFERIDA)S?",
+    re.IGNORECASE,
+)
+
+# CORREÇÃO 02/10/2026 (2ª): detectado no teste real da edição de 02/10/2026 —
+# a página 32 tinha 5 atos distintos da FUNED (quinquênio, retificação de
+# férias prêmio, duas dispensas/designações de função gratificada, e uma
+# portaria criando uma unidade), mas o modelo gratuito só extraiu 1 deles. A
+# página tinha ~36 mil caracteres com publicações de VÁRIOS outros órgãos
+# misturadas (SES, CIB-SUS/MG etc.) — é "agulha no palheiro" demais pra um
+# modelo gratuito garantir que viu tudo. Em vez de confiar só na atenção do
+# modelo, contamos aqui, de forma determinística, quantas menções distintas
+# ao termo existem na página, pra (a) avisar o modelo quantas ele precisa
+# justificar e (b) conferir depois, no main.py, se cada uma foi mesmo
+# coberta por alguma publicação extraída.
+RE_MENCAO_FUNED = re.compile(
+    r"Funda[cç][aã]o\s+Ezequiel\s+Dias|\bFUNED\b",
+    re.IGNORECASE,
+)
+
+
+def _agrupar_mencoes_funed(texto: str, raio_cluster: int = 80) -> list[str]:
+    """Encontra todas as ocorrências de 'FUNED'/'Fundação Ezequiel Dias' no
+    texto da página e agrupa as que estão muito próximas (ex: 'Fundação
+    Ezequiel Dias - FUNED' escritos juntos, que são a mesma menção, não
+    duas) num único "trecho". Devolve um trecho de texto (um pedaço do
+    conteúdo original ao redor de cada grupo) por menção distinta — usado
+    depois pra conferir se cada uma virou alguma publicação."""
+    posicoes = [m.start() for m in RE_MENCAO_FUNED.finditer(texto)]
+    if not posicoes:
+        return []
+
+    grupos: list[int] = [posicoes[0]]
+    for pos in posicoes[1:]:
+        if pos - grupos[-1] > raio_cluster:
+            grupos.append(pos)
+        # senão, é a mesma menção (ex: "Fundação Ezequiel Dias" seguido de
+        # "FUNED" logo depois) — não conta como uma segunda ocorrência.
+
+    return [
+        texto[max(0, pos - 30): pos + 150]
+        for pos in grupos
+    ]
+
 MAX_TENTATIVAS_MONITORAMENTO = 4
 ESPERAS_MONITORAMENTO_SEGUNDOS = [5, 10, 20]
 STATUS_REPETIVEIS = {401, 408, 429, 500, 502, 503, 504}
 
 app = FastAPI(
     title="FUNED Diário Oficial Service",
-    version="3.4.0",
+    version="3.6.0",
 )
 
 
@@ -375,6 +427,16 @@ def extrair_publicacoes_pdf(
     # tinha como saber a categoria correta olhando só a página do match.
     texto_pagina_anterior = ""
 
+    # CORREÇÃO 02/10/2026: estado que atravessa TODAS as páginas (não só a
+    # anterior), guardando a última categoria "DEFERIDA"/"INDEFERIDA" vista
+    # em qualquer página já processada. Testado com a edição de 02/10/2026:
+    # a tabela da página 29 (Edilene De Jesus Ferreira, Sandra Teresinha Dos
+    # Santos Gomes) não tinha cabeçalho nem na própria página 29 nem na 28
+    # (a anterior) — o cabeçalho que realmente valia estava na página 27.
+    # Por isso o estado precisa ser global ao documento, não só da página
+    # anterior.
+    categoria_licenca_vigente: str | None = None
+
     for indice, pagina in enumerate(leitor.pages):
         numero_pagina = indice + 1
 
@@ -398,14 +460,55 @@ def extrair_publicacoes_pdf(
             if termo_normalizado in texto_normalizado
         ]
 
+        cabecalhos_na_pagina = list(RE_CATEGORIA_LICENCA.finditer(texto))
+
         if termos_encontrados:
+            # Posição do primeiro trecho que bateu com algum termo buscado,
+            # pra saber qual cabeçalho de categoria (se algum) vem ANTES dele
+            # nesta mesma página, na ordem real do texto extraído.
+            posicao_termo = None
+            for termo_original in termos_encontrados:
+                pos = texto_normalizado.find(
+                    normalizar_texto(termo_original)
+                )
+                if pos != -1 and (posicao_termo is None or pos < posicao_termo):
+                    posicao_termo = pos
+
+            categoria_nesta_pagina = categoria_licenca_vigente
+            if posicao_termo is not None:
+                cabecalhos_antes = [
+                    m for m in cabecalhos_na_pagina
+                    if m.start() < posicao_termo
+                ]
+                if cabecalhos_antes:
+                    categoria_nesta_pagina = (
+                        cabecalhos_antes[-1].group(1).upper()
+                    )
+            # senão, mantém categoria_licenca_vigente (carregada das páginas
+            # anteriores) — é o caso em que o item da FUNED aparece antes de
+            # qualquer cabeçalho nesta página, ou seja, a tabela começou
+            # antes e segue valendo a última categoria vista.
+
+            trechos_mencoes = _agrupar_mencoes_funed(texto)
+
             publicacoes.append(
                 {
                     "pagina": numero_pagina,
                     "termosEncontrados": termos_encontrados,
                     "textoPagina": texto,
                     "textoPaginaAnterior": texto_pagina_anterior,
+                    "categoriaLicencaVigente": categoria_nesta_pagina,
+                    "totalMencoesFuned": len(trechos_mencoes),
+                    "trechosMencoesFuned": trechos_mencoes,
                 }
+            )
+
+        # Atualiza o estado global com o último cabeçalho visto nesta
+        # página (se houve algum) — vale pra próxima página, não importa
+        # quantas páginas sem cabeçalho vierem depois.
+        if cabecalhos_na_pagina:
+            categoria_licenca_vigente = (
+                cabecalhos_na_pagina[-1].group(1).upper()
             )
 
         texto_pagina_anterior = texto
@@ -1062,7 +1165,7 @@ async def raiz() -> dict[str, str]:
     return {
         "servico": "FUNED Diário Oficial",
         "status": "online",
-        "versao": "3.4.0",
+        "versao": "3.6.0",
     }
 
 
@@ -1070,7 +1173,7 @@ async def raiz() -> dict[str, str]:
 async def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "versao": "3.4.0",
+        "versao": "3.6.0",
     }
 
 
