@@ -188,7 +188,7 @@ def buscar_paginas_diario():
                     f"(resposta do serviço: {detalhe}). Seguindo sem páginas.",
                     file=sys.stderr,
                 )
-                return []
+                return [], None
 
             resp.raise_for_status()
             corpo = resp.json()
@@ -222,7 +222,14 @@ def buscar_paginas_diario():
                 }
                 for p in publicacoes_brutas
             ]
-            return paginas_normalizadas
+            # CORREÇÃO 02/10/2026 (3ª): link para a edição completa do Diário
+            # no portal oficial (jornalminasgerais.mg.gov.br), montado pelo
+            # app.py (ver montar_link_edicao). É o MESMO link para todas as
+            # páginas de uma mesma data — o portal não tem parâmetro de
+            # página específica nessa URL, só abre a edição inteira — então
+            # ele é devolvido uma única vez aqui, fora da lista de páginas.
+            link_edicao = dados.get("linkEdicao")
+            return paginas_normalizadas, link_edicao
         except Exception as e:  # noqa: BLE001
             ultimo_erro = e
             print(f"[tentativa {tentativa}] erro ao chamar Render: {e}", file=sys.stderr)
@@ -985,7 +992,7 @@ def _card_publicacao(idx, pub):
       <p style="margin:6px 0;"><strong>Data ou período:</strong> {pub.get('data_periodo', 'não informado')}</p>
       <p style="margin:6px 0;"><strong>Pessoa(s) relacionada(s):</strong><br>{pessoas_html}</p>
       <p style="margin:6px 0;"><strong style="color:#7a1626;">Resumo objetivo</strong></p>
-      <p style="margin:0;">{pub.get('resumo_objetivo', '')}</p>
+      <p style="margin:0; color:#4a4d52;">{pub.get('resumo_objetivo', '')}</p>
     </div>
     """
 
@@ -1032,11 +1039,28 @@ def renderizar_email_html(dados):
         </div>
         """
 
+    link_edicao = dados.get("link_edicao")
+    # CORREÇÃO 02/10/2026 (3ª): link pedido pela SDC pra abrir a edição do
+    # Diário Oficial de hoje direto no portal oficial. O portal não tem um
+    # parâmetro de página específica nessa URL — ela abre a edição completa
+    # do dia, e a pessoa navega até a página indicada em cada card abaixo.
+    # Por isso o link aparece uma única vez aqui (é o mesmo pra todas as
+    # publicações do dia), em vez de repetido em cada card.
+    linha_link_edicao = ""
+    if link_edicao:
+        linha_link_edicao = f"""
+      <p style="margin:6px 0;"><strong style="color:#7a1626;">Edição completa:</strong>
+        <a href="{link_edicao}" style="color:#a31f2e; text-decoration:underline;">abrir no portal do Diário Oficial</a>
+        <span style="color:#4a4d52; font-size:12px;"> (navegue até a página indicada em cada publicação abaixo)</span>
+      </p>
+        """
+
     resumo_box = f"""
     <div style="background:#f2f2f3; border-left:4px solid #a31f2e; border-radius:6px; padding:16px; margin:20px 0;">
       <p style="margin:6px 0;"><strong style="color:#7a1626;">Data da edição:</strong> {DATA_HOJE_BR}</p>
       <p style="margin:6px 0;"><strong style="color:#7a1626;">Páginas com atos identificados:</strong> {', '.join(str(p) for p in paginas_com_atos) or 'nenhuma'}</p>
       <p style="margin:6px 0;"><strong style="color:#7a1626;">Total de atos identificados:</strong> {len(publicacoes)}</p>
+      {linha_link_edicao}
     </div>
     """
 
@@ -1112,7 +1136,7 @@ def enviar_email(html, destinatarios):
 def main():
     print(f"Iniciando monitoramento do Diário Oficial FUNED - {DATA_HOJE_BR}")
 
-    paginas = buscar_paginas_diario()
+    paginas, link_edicao = buscar_paginas_diario()
     print(f"{len(paginas)} página(s) recebida(s) do serviço Render.")
     for p in paginas:
         tamanho = len(p.get("texto") or "")
@@ -1120,6 +1144,7 @@ def main():
         print(f"  -> página {p.get('numero')}: {tamanho} caractere(s) — início: {inicio_texto!r}")
 
     dados = extrair_publicacoes(paginas)
+    dados["link_edicao"] = link_edicao
     print(f"{len(dados.get('publicacoes', []))} publicação(ões) identificada(s).")
 
     # CORREÇÃO 18/09/2026 — Rede de segurança (ver comentário em
