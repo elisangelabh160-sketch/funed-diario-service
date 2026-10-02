@@ -274,7 +274,7 @@ seguinte formato exato:
       "pessoas": [
         {"nome": "NOME COMPLETO EM MAIÚSCULAS", "masp": "número do MASP", "adm": "Adm. N ou null"}
       ],
-      "conteudo_oficial": "trecho oficial extraído literalmente do texto da página, sem corrigir acentuação nem reescrever",
+      "trecho_verificacao": "trecho CURTO (1-3 linhas, não um parágrafo inteiro) extraído literalmente do texto da página — usado só internamente para conferir automaticamente que a publicação é mesmo da FUNED e que as pessoas listadas realmente aparecem nela. NUNCA é mostrado ao leitor do e-mail, então não precisa ser bonito nem completo: só precisa conter (a) a palavra 'FUNED' ou 'Fundação Ezequiel Dias' tal como aparece no texto, e (b) literalmente o nome ou MASP de cada pessoa listada em 'pessoas' (pode juntar pedaços não-contínuos do texto com '(...)' no meio, se precisar, pra não ficar longo).",
       "resumo_objetivo": "1-3 frases em linguagem simples explicando o que foi decidido/autorizado"
     }
   ]
@@ -311,11 +311,12 @@ Regras importantes:
   outros atos (como portarias completas) que também estejam na mesma página. Mas se
   houver tabelas SEPARADAS de tipos diferentes (ex: uma de licenças DEFERIDAS e outra de
   licenças INDEFERIDAS), cada uma é uma publicação diferente — não junte as duas.
-- "conteudo_oficial" deve ser um recorte fiel do texto original da página (não invente, não resuma aqui).
+- "trecho_verificacao" deve ser um recorte fiel do texto original da página (não invente, não
+  resuma aqui) — mas pode e deve ser CURTO, já que não aparece no e-mail final.
 - IMPORTANTE: o campo "pessoas" de uma publicação deve conter SOMENTE pessoas que também
-  apareçam no texto de "conteudo_oficial" DESSA MESMA publicação. Nunca copie nomes de uma
+  apareçam no texto de "trecho_verificacao" DESSA MESMA publicação. Nunca copie nomes de uma
   tabela maior (ex: de outros órgãos, ou de antes de você filtrar quem é da FUNED) para
-  dentro de "pessoas" se esses nomes não estiverem no trecho de "conteudo_oficial" que você
+  dentro de "pessoas" se esses nomes não estiverem no trecho de "trecho_verificacao" que você
   realmente extraiu. As duas listas têm que bater.
 - "resumo_objetivo" é o único campo que deve estar em linguagem simplificada.
 - Se uma publicação citar múltiplas pessoas, liste todas em "pessoas".
@@ -572,7 +573,7 @@ def _extrair_json(texto_resposta):
 
 def _normalizar(texto):
     """Remove acentos e baixa a caixa, pra comparação de texto ser tolerante a
-    pequenas diferenças de acentuação/maiúsculas entre 'pessoas' e 'conteudo_oficial'."""
+    pequenas diferenças de acentuação/maiúsculas entre 'pessoas' e 'trecho_verificacao'."""
     if not texto:
         return ""
     sem_acento = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
@@ -581,7 +582,7 @@ def _normalizar(texto):
 
 def _pessoa_aparece_no_conteudo(pessoa, conteudo_normalizado, conteudo_digitos):
     """Confere se a pessoa (por MASP ou por nome) realmente aparece no trecho de
-    'conteudo_oficial' dessa mesma publicação."""
+    'trecho_verificacao' dessa mesma publicação."""
     masp_digitos = re.sub(r"\D", "", str(pessoa.get("masp") or ""))
     if masp_digitos and masp_digitos in conteudo_digitos:
         return True
@@ -592,7 +593,7 @@ def _pessoa_aparece_no_conteudo(pessoa, conteudo_normalizado, conteudo_digitos):
     if nome in conteudo_normalizado:
         return True
 
-    # Às vezes o "conteudo_oficial" tem o nome com espaçamento/quebra de linha
+    # Às vezes o "trecho_verificacao" tem o nome com espaçamento/quebra de linha
     # diferente do campo "pessoas". Aceita também se o PRIMEIRO nome e o
     # ÚLTIMO sobrenome baterem os dois — reduz bastante falso positivo de
     # nomes "roubados" de outra tabela/órgão, que dificilmente vão bater os
@@ -611,16 +612,16 @@ def _filtrar_pessoas_consistentes(dados):
     corrigir um problema recorrente do modelo gratuito: o campo 'pessoas' de uma
     publicação às vezes vem com dezenas de nomes copiados de uma tabela
     maior/compartilhada entre vários órgãos, mesmo esses nomes não aparecendo no
-    trecho de 'conteudo_oficial' que o modelo realmente extraiu como sendo da
+    trecho de 'trecho_verificacao' que o modelo realmente extraiu como sendo da
     FUNED. Pedir isso só via prompt não foi suficiente em testes reais (o mesmo
     problema se repetiu em rodadas seguidas mesmo com a instrução no prompt), então
     aqui filtramos com certeza: só mantém em 'pessoas' quem realmente aparece (por
-    nome ou MASP) no 'conteudo_oficial' da mesma publicação."""
+    nome ou MASP) no 'trecho_verificacao' da mesma publicação."""
     for pub in dados.get("publicacoes", []):
         pessoas = pub.get("pessoas") or []
         if not pessoas:
             continue
-        conteudo_normalizado = _normalizar(pub.get("conteudo_oficial") or "")
+        conteudo_normalizado = _normalizar(pub.get("trecho_verificacao") or "")
         if not conteudo_normalizado:
             continue
         conteudo_digitos = re.sub(r"\D", "", conteudo_normalizado)
@@ -628,7 +629,7 @@ def _filtrar_pessoas_consistentes(dados):
             p for p in pessoas if _pessoa_aparece_no_conteudo(p, conteudo_normalizado, conteudo_digitos)
         ]
         # Se o filtro zerasse TODAS as pessoas, é mais provável que o texto de
-        # "conteudo_oficial" esteja num formato inesperado do que todas as
+        # "trecho_verificacao" esteja num formato inesperado do que todas as
         # pessoas estarem erradas — nesse caso, mantém a lista original pra não
         # perder informação real por causa de um falso negativo do filtro.
         if pessoas_filtradas:
@@ -733,7 +734,7 @@ def _chamar_llm_para_pagina(pagina):
 # indeferimento de pensão que, pela ordem real do texto da página, pertence
 # ao IPSEMG (Instituto de Previdência dos Servidores do Estado de MG), uma
 # autarquia diferente que só compartilha a página com a FUNED. O trecho de
-# "conteudo_oficial" dessa publicação não citava "FUNED"/"Fundação Ezequiel
+# "trecho_verificacao" dessa publicação não citava "FUNED"/"Fundação Ezequiel
 # Dias" em lugar nenhum. Por isso, valida-se aqui — não só no prompt — que
 # cada publicação realmente cita a FUNED dentro do próprio conteúdo oficial
 # extraído; quem não citar é descartada (silenciosamente, por pedido).
@@ -741,10 +742,10 @@ TERMOS_ATRIBUICAO_FUNED = ["Fundação Ezequiel Dias", "FUNED", "Funed"]
 
 
 def _publicacao_atribuida_a_funed(pub):
-    """Confere se o trecho de 'conteudo_oficial' realmente cita a FUNED (por
+    """Confere se o trecho de 'trecho_verificacao' realmente cita a FUNED (por
     nome completo ou sigla) em algum lugar dele — não basta a palavra ter
     aparecido em outro ponto da página."""
-    conteudo_normalizado = _normalizar(pub.get("conteudo_oficial") or "")
+    conteudo_normalizado = _normalizar(pub.get("trecho_verificacao") or "")
     if not conteudo_normalizado:
         return False
     termos = TERMOS_ATRIBUICAO_FUNED + [TEXTO_BUSCA]
@@ -754,7 +755,7 @@ def _publicacao_atribuida_a_funed(pub):
 def _verificar_cobertura_mencoes(pagina, publicacoes_validas):
     """Confere, de forma determinística, se cada menção distinta a
     'FUNED'/'Fundação Ezequiel Dias' contada pelo app.py (campo
-    'trechos_mencoes_funed') está representada em algum 'conteudo_oficial'
+    'trechos_mencoes_funed') está representada em algum 'trecho_verificacao'
     das publicações que a IA extraiu pra essa página. Devolve True se
     alguma menção ficou sem cobertura (sinal de que a IA pode ter deixado
     passar algum ato) — usado só como ALERTA pro e-mail, não bloqueia nada.
@@ -765,32 +766,34 @@ def _verificar_cobertura_mencoes(pagina, publicacoes_validas):
     vários outros órgãos). O aviso de "verificação manual" existente só
     disparava quando a página ficava com ZERO publicações; esse caso
     passou batido porque 1 publicação foi extraída com sucesso. Essa função
-    fecha essa lacuna."""
-    trechos = pagina.get("trechos_mencoes_funed") or []
-    if not trechos:
+    fecha essa lacuna.
+
+    CORREÇÃO 02/10/2026 (3ª): a versão original comparava o texto de cada
+    menção (bruta, da página) contra o 'trecho_verificacao' de cada
+    publicação, exigindo que TODAS as menções aparecessem literalmente. Isso
+    funcionava bem quando 'trecho_verificacao' ainda se chamava
+    'conteudo_oficial' e era um parágrafo inteiro — mas depois que esse
+    campo passou a ser curto (a pedido, pra reduzir o texto que a IA precisa
+    gerar), um mesmo ato legítimo passou a "reprovar" sempre: a FUNED pode
+    ser citada 2x no texto de UM único ato (ex: no título E no corpo), mas o
+    trecho curto só reproduz uma dessas citações, então a 2ª nunca batia —
+    e isso disparava o aviso em TODAS as páginas, mesmo nas 100% corretas
+    (visto na edição de 02/10/2026: páginas 27, 29, 32 e 49 foram marcadas
+    juntas, incluindo páginas sem problema nenhum). Por isso, a checagem
+    agora não depende mais do texto do 'trecho_verificacao': compara só a
+    PROPORÇÃO entre menções brutas contadas na página e publicações
+    realmente extraídas. Como cada ato tende a citar a FUNED 1-2 vezes, uma
+    página com bem mais menções do que publicações extraídas (ex: 8 menções
+    pra 1 publicação, como na página 32) ainda aciona o aviso — mas uma
+    página normal, com 1-3 menções pra cada publicação já capturada, não."""
+    total_mencoes = pagina.get("total_mencoes_funed") or len(
+        pagina.get("trechos_mencoes_funed") or []
+    )
+    if total_mencoes == 0:
         return False
 
-    conteudo_unido = _normalizar(
-        " ".join(
-            pub.get("conteudo_oficial") or ""
-            for pub in publicacoes_validas
-        )
-    )
-    if not conteudo_unido:
-        return True
-
-    mencoes_sem_cobertura = 0
-    for trecho in trechos:
-        # usa um miolo do trecho (não o trecho inteiro) pra tolerar pequenas
-        # diferenças de espaçamento/quebra de linha entre o texto bruto da
-        # página e o "conteudo_oficial" que a IA recortou.
-        miolo = _normalizar(trecho)[10:70].strip()
-        if not miolo:
-            continue
-        if miolo not in conteudo_unido:
-            mencoes_sem_cobertura += 1
-
-    return mencoes_sem_cobertura > 0
+    limite_esperado = 2 * max(1, len(publicacoes_validas)) + 1
+    return total_mencoes > limite_esperado
 
 
 def _processar_uma_pagina(pagina):
@@ -911,14 +914,14 @@ def extrair_publicacoes(paginas):
             elif publicacoes_validas:
                 ja_capturadas = _normalizar(
                     " ".join(
-                        pub.get("conteudo_oficial") or ""
+                        pub.get("trecho_verificacao") or ""
                         for pub in todas_publicacoes
                         if pub.get("pagina") == numero
                     )
                 )
                 novas = [
                     pub for pub in publicacoes_validas
-                    if _normalizar(pub.get("conteudo_oficial") or "")[:80]
+                    if _normalizar(pub.get("trecho_verificacao") or "")[:80]
                     not in ja_capturadas
                 ]
                 if novas:
@@ -970,20 +973,16 @@ def _card_publicacao(idx, pub):
     ) or "Não informado"
 
     return f"""
-    <div style="border:1px solid #e2e8f0; border-left:4px solid #1e3a5f; border-radius:6px; padding:16px; margin-bottom:16px; background:#ffffff;">
-      <h3 style="margin:0 0 12px 0; color:#1e3a5f; font-size:17px;">
-        <span style="display:inline-block; background:#1e3a5f; color:#c9a24b; border-radius:50%; width:22px; height:22px; text-align:center; line-height:22px; font-size:12px; font-weight:bold; margin-right:6px;">{idx}</span>
+    <div style="border:1px solid #e2e8f0; border-left:4px solid #7a1626; border-radius:6px; padding:16px; margin-bottom:16px; background:#ffffff;">
+      <h3 style="margin:0 0 12px 0; color:#7a1626; font-size:17px;">
+        <span style="display:inline-block; background:#7a1626; color:#e3e4e6; border-radius:50%; width:22px; height:22px; text-align:center; line-height:22px; font-size:12px; font-weight:bold; margin-right:6px;">{idx}</span>
         Página {pub.get('pagina', '?')}
       </h3>
       <p style="margin:6px 0;"><strong>Categoria:</strong> {pub.get('categoria', 'não informado')}</p>
       <p style="margin:6px 0;"><strong>Tipo do ato:</strong> {pub.get('tipo_do_ato', 'não informado')}</p>
       <p style="margin:6px 0;"><strong>Data ou período:</strong> {pub.get('data_periodo', 'não informado')}</p>
       <p style="margin:6px 0;"><strong>Pessoa(s) relacionada(s):</strong><br>{pessoas_html}</p>
-      <div style="background:#faf3e0; border:1px solid #e6d5a8; border-radius:6px; padding:12px; margin:12px 0;">
-        <p style="margin:0 0 6px 0; color:#8a6d3b; font-weight:bold; font-size:12px; letter-spacing:0.5px;">CONTEÚDO OFICIAL IDENTIFICADO</p>
-        <p style="margin:0; white-space:pre-wrap;">{pub.get('conteudo_oficial', '')}</p>
-      </div>
-      <p style="margin:6px 0;"><strong style="color:#1e3a5f;">Resumo objetivo</strong></p>
+      <p style="margin:6px 0;"><strong style="color:#7a1626;">Resumo objetivo</strong></p>
       <p style="margin:0;">{pub.get('resumo_objetivo', '')}</p>
     </div>
     """
@@ -996,7 +995,7 @@ def renderizar_email_html(dados):
 
     if not publicacoes:
         aviso_sem_resultado = """
-        <div style="background:#faf6ec; border-left:4px solid #c9a24b; border-radius:6px; padding:16px;">
+        <div style="background:#f2f2f3; border-left:4px solid #a31f2e; border-radius:6px; padding:16px;">
           <p style="margin:0;">Nenhuma publicação relacionada à FUNED foi identificada na edição de hoje.</p>
         </div>
         """
@@ -1032,10 +1031,10 @@ def renderizar_email_html(dados):
         """
 
     resumo_box = f"""
-    <div style="background:#faf6ec; border-left:4px solid #c9a24b; border-radius:6px; padding:16px; margin:20px 0;">
-      <p style="margin:6px 0;"><strong style="color:#1e3a5f;">Data da edição:</strong> {DATA_HOJE_BR}</p>
-      <p style="margin:6px 0;"><strong style="color:#1e3a5f;">Páginas com atos identificados:</strong> {', '.join(str(p) for p in paginas_com_atos) or 'nenhuma'}</p>
-      <p style="margin:6px 0;"><strong style="color:#1e3a5f;">Total de atos identificados:</strong> {len(publicacoes)}</p>
+    <div style="background:#f2f2f3; border-left:4px solid #a31f2e; border-radius:6px; padding:16px; margin:20px 0;">
+      <p style="margin:6px 0;"><strong style="color:#7a1626;">Data da edição:</strong> {DATA_HOJE_BR}</p>
+      <p style="margin:6px 0;"><strong style="color:#7a1626;">Páginas com atos identificados:</strong> {', '.join(str(p) for p in paginas_com_atos) or 'nenhuma'}</p>
+      <p style="margin:6px 0;"><strong style="color:#7a1626;">Total de atos identificados:</strong> {len(publicacoes)}</p>
     </div>
     """
 
@@ -1048,19 +1047,19 @@ def renderizar_email_html(dados):
     selo_sdc = """
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="margin:0 auto 18px auto;">
           <tr>
-            <td style="width:64px; height:64px; border-radius:50%; border:2px solid #c9a24b; background:#1e3a5f; text-align:center; vertical-align:middle; font-family:Arial, Helvetica, sans-serif;">
-              <span style="display:inline-block; color:#c9a24b; font-size:14px; font-weight:bold; letter-spacing:1.5px;">SDC</span>
+            <td style="width:64px; height:64px; border-radius:50%; border:2px solid #d4d5d7; background:#7a1626; text-align:center; vertical-align:middle; font-family:Arial, Helvetica, sans-serif;">
+              <span style="display:inline-block; color:#d4d5d7; font-size:14px; font-weight:bold; letter-spacing:1.5px;">SDC</span>
             </td>
           </tr>
         </table>
     """
 
     return f"""
-    <div style="max-width:600px; margin:0 auto; font-family:Arial, Helvetica, sans-serif; color:#1a1a1a;">
-      <div style="background:#1e3a5f; border-radius:8px 8px 0 0; padding:28px 24px 24px 24px; text-align:center;">
+    <div style="max-width:760px; width:100%; margin:0 auto; font-family:Arial, Helvetica, sans-serif; color:#1a1a1a;">
+      <div style="background:#7a1626; border-radius:8px 8px 0 0; padding:28px 24px 24px 24px; text-align:center;">
         {selo_sdc}
         <h1 style="margin:0; color:#ffffff; font-size:22px; letter-spacing:0.3px;">Monitoramento do Diário Oficial</h1>
-        <p style="margin:8px 0 0 0; color:#c9a24b; font-size:13px; text-transform:uppercase; letter-spacing:1px;">Fundação Ezequiel Dias – FUNED</p>
+        <p style="margin:8px 0 0 0; color:#d4d5d7; font-size:13px; text-transform:uppercase; letter-spacing:1px;">Fundação Ezequiel Dias – FUNED</p>
       </div>
       <div style="border:1px solid #e2e8f0; border-top:none; border-radius:0 0 8px 8px; padding:24px;">
         {resumo_box}
@@ -1070,14 +1069,14 @@ def renderizar_email_html(dados):
         <hr style="border:none; border-top:1px solid #e2e8f0; margin:24px 0;">
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="margin:0 auto 10px auto;">
           <tr>
-            <td style="width:30px; height:30px; border-radius:50%; border:1.5px solid #c9a24b; background:#1e3a5f; text-align:center; vertical-align:middle;">
-              <span style="display:inline-block; color:#c9a24b; font-size:8px; font-weight:bold; letter-spacing:0.5px;">SDC</span>
+            <td style="width:30px; height:30px; border-radius:50%; border:1.5px solid #d4d5d7; background:#7a1626; text-align:center; vertical-align:middle;">
+              <span style="display:inline-block; color:#d4d5d7; font-size:8px; font-weight:bold; letter-spacing:0.5px;">SDC</span>
             </td>
           </tr>
         </table>
         <p style="margin:0; color:#8a94a3; font-size:12px; text-align:center;">
           Relatório gerado automaticamente para apoio ao monitoramento institucional da FUNED.<br>
-          <strong style="color:#1e3a5f;">Serviço de Desenvolvimento e Capacitação — SDC</strong>
+          <strong style="color:#7a1626;">Serviço de Desenvolvimento e Capacitação — SDC</strong>
         </p>
       </div>
     </div>
