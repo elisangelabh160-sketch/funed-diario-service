@@ -159,7 +159,7 @@ STATUS_REPETIVEIS = {401, 408, 429, 500, 502, 503, 504}
 
 app = FastAPI(
     title="FUNED Diário Oficial Service",
-    version="3.7.0",
+    version="3.8.1",
 )
 
 
@@ -1095,6 +1095,18 @@ async def executar_monitoramento_uma_vez(
                 "Chrome/130.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1440, "height": 1000},
+            # CORREÇÃO 23/10/2026: o portal jornalminasgerais.mg.gov.br usa
+            # certificado da cadeia ICP-Brasil, que não está incluído no
+            # conjunto de autoridades certificadoras que o Playwright usa
+            # internamente para chamadas via `contexto.request.get` (isso é
+            # diferente da navegação normal de página, que usa os
+            # certificados do sistema operacional — por isso a navegação
+            # funcionava, mas a chamada à API ObterEdicaoPorId falhava com
+            # "unable to verify the first certificate"). Como o domínio é o
+            # próprio portal oficial do governo de MG (confiável), ignorar a
+            # validação da cadeia aqui é seguro e resolve o erro sem
+            # depender de instalar a raiz ICP-Brasil no ambiente do Render.
+            ignore_https_errors=True,
         )
 
         pagina = await contexto.new_page()
@@ -1249,7 +1261,7 @@ async def raiz() -> dict[str, str]:
     return {
         "servico": "FUNED Diário Oficial",
         "status": "online",
-        "versao": "3.7.0",
+        "versao": "3.8.1",
     }
 
 
@@ -1257,7 +1269,7 @@ async def raiz() -> dict[str, str]:
 async def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "versao": "3.7.0",
+        "versao": "3.8.1",
     }
 
 
