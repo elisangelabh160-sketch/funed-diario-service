@@ -77,7 +77,82 @@ DESTINATARIOS = [e.strip() for e in os.environ["DESTINATARIOS"].split(",") if e.
 # o limite de tokens antes de chegar no JSON de verdade. Este aqui é um
 # modelo de chat/instrução direta (sem essa etapa de raciocínio longo) com
 # contexto grande, o que deve dar resultado bem mais consistente.
-MODELO_LLM = "poolside/laguna-s-2.1:free"
+#
+# CORREÇÃO 05/11/2026: o "poolside/laguna-s-2.1:free" foi REMOVIDO da OpenRouter
+# (passou a responder "404 Not Found" em todas as chamadas) e, com isso, o e-mail
+# de 05/11/2026 saiu com ZERO publicações mesmo com atos da FUNED nas páginas
+# 1, 2, 12, 27 etc. Modelos gratuitos somem sem aviso, então em vez de depender
+# de UM modelo só, agora existe uma LISTA em ordem de preferência: se um modelo
+# responder 404/400/403 (saiu do ar / não aceita o pedido), o sistema passa
+# sozinho para o próximo da lista — e lembra disso para as páginas seguintes,
+# sem gastar tentativas repetindo um modelo morto. Além disso, no começo da
+# execução ele consulta a lista pública de modelos da OpenRouter e descarta os
+# que não existem mais; modelos ":free" novos com contexto grande entram como
+# reserva no fim da fila. Para forçar um modelo específico no topo, basta
+# criar a variável de ambiente (secret) MODELO_LLM no GitHub.
+MODELOS_LLM_PREFERIDOS = [
+    "google/gemma-4-31b-it:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "nvidia/nemotron-3.5-super-vl:free",
+    "nvidia/nemotron-3.5-lightning:free",
+    "openrouter/free",
+]
+_MODELOS_ORDEM = None
+_MODELOS_INDISPONIVEIS = set()
+
+
+def _obter_ordem_de_modelos():
+    """Monta (uma vez por execução) a fila de modelos a tentar."""
+    global _MODELOS_ORDEM
+    if _MODELOS_ORDEM is not None:
+        return _MODELOS_ORDEM
+
+    fila = list(MODELOS_LLM_PREFERIDOS)
+    try:
+        resp = requests.get("https://openrouter.ai/api/v1/models", timeout=30)
+        resp.raise_for_status()
+        catalogo = resp.json().get("data", [])
+        ids_no_ar = {m.get("id") for m in catalogo}
+        preferidos_no_ar = [
+            m for m in fila if m in ids_no_ar or m == "openrouter/free"
+        ]
+        extras = sorted(
+            (
+                m for m in catalogo
+                if str(m.get("id", "")).endswith(":free")
+                and m["id"] not in fila
+                and (m.get("context_length") or 0) >= 128_000
+                and not any(x in m["id"] for x in ("safety", "guard", "embed"))
+            ),
+            key=lambda m: m.get("context_length") or 0,
+            reverse=True,
+        )
+        if preferidos_no_ar:
+            # extras entram antes do "openrouter/free" (roteador genérico, último recurso)
+            fila = [m for m in preferidos_no_ar if m != "openrouter/free"]
+            fila += [m["id"] for m in extras[:4]]
+            fila.append("openrouter/free")
+        print(f"[modelos] fila de modelos nesta execução: {fila}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"[modelos] não consegui consultar o catálogo da OpenRouter ({e}); "
+            f"usando a lista padrão: {fila}",
+            file=sys.stderr,
+        )
+
+    forcado = os.environ.get("MODELO_LLM", "").strip()
+    if forcado:
+        fila = [forcado] + [m for m in fila if m != forcado]
+    _MODELOS_ORDEM = fila
+    return _MODELOS_ORDEM
+
+
+def _proximo_modelo_disponivel():
+    for modelo in _obter_ordem_de_modelos():
+        if modelo not in _MODELOS_INDISPONIVEIS:
+            return modelo
+    return None
 
 # Texto de busca: mesmo padrão default do serviço. Pode sobrescrever com a env
 # var TEXTO_PESQUISA se preferir usar "Funed" como no fluxo n8n antigo.
@@ -655,7 +730,7 @@ def _chamar_llm_para_pagina(pagina):
     """Faz a chamada à OpenRouter para o texto de UMA única página e devolve o
     JSON já extraído (dict com "publicacoes"). Repete em caso de erro."""
     corpo = {
-        "model": MODELO_LLM,
+        "model": None,  # definido a cada tentativa (ver fila de modelos acima)
         "messages": [
             {"role": "system", "content": PROMPT_SISTEMA},
             {"role": "user", "content": montar_prompt_usuario_pagina(pagina)},
@@ -675,7 +750,25 @@ def _chamar_llm_para_pagina(pagina):
     }
 
     ultimo_erro = None
-    for tentativa in range(1, MAX_TENTATIVAS + 1):
+    tentativa = 0
+    # Erros de "modelo" (404/400/403/402 = modelo removido, não aceita o
+    # pedido, sem acesso) NÃO gastam tentativas: trocam de modelo na hora.
+    trocas_de_modelo = 0
+    sem_response_format = set()
+    while tentativa < MAX_TENTATIVAS:
+        modelo = _proximo_modelo_disponivel()
+        if modelo is None:
+            raise RuntimeError(
+                f"Nenhum modelo de IA disponível na OpenRouter para a página "
+                f"{pagina['numero']} (todos da fila responderam erro de modelo). "
+                f"Último erro: {ultimo_erro}"
+            )
+        corpo["model"] = modelo
+        if modelo in sem_response_format:
+            corpo.pop("response_format", None)
+        else:
+            corpo["response_format"] = {"type": "json_object"}
+        tentativa += 1
         try:
             resp = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -686,6 +779,25 @@ def _chamar_llm_para_pagina(pagina):
                 json=corpo,
                 timeout=180,
             )
+            if resp.status_code in (400, 402, 403, 404):
+                detalhe = resp.text[:400]
+                print(
+                    f"  [página {pagina['numero']}] modelo {modelo} respondeu "
+                    f"HTTP {resp.status_code}: {detalhe!r}",
+                    file=sys.stderr,
+                )
+                ultimo_erro = f"{modelo}: HTTP {resp.status_code}"
+                tentativa -= 1  # erro de modelo não consome tentativa
+                trocas_de_modelo += 1
+                if trocas_de_modelo > 25:
+                    raise RuntimeError(f"Excesso de trocas de modelo: {ultimo_erro}")
+                if resp.status_code in (400, 404) and modelo not in sem_response_format:
+                    # alguns modelos não aceitam response_format: tenta o MESMO
+                    # modelo uma vez sem ele antes de descartá-lo.
+                    sem_response_format.add(modelo)
+                else:
+                    _MODELOS_INDISPONIVEIS.add(modelo)
+                continue
             resp.raise_for_status()
             corpo_resposta = resp.json()
             if "choices" not in corpo_resposta:
@@ -696,7 +808,7 @@ def _chamar_llm_para_pagina(pagina):
             conteudo = corpo_resposta["choices"][0]["message"]["content"]
             print(
                 f"  [página {pagina['numero']} / tentativa {tentativa}] resposta recebida "
-                f"({len(conteudo)} caractere(s)).",
+                f"({len(conteudo)} caractere(s)) do modelo {modelo}.",
                 file=sys.stderr,
             )
             try:
