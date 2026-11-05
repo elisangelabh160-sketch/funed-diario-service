@@ -148,11 +148,37 @@ def _obter_ordem_de_modelos():
     return _MODELOS_ORDEM
 
 
+# CORREÇÃO 05/11/2026 (2ª): depois de trocar o modelo removido, o run seguinte
+# passou a tomar "429 Too Many Requests" no 1º modelo da fila e ficou 11+
+# minutos repetindo o MESMO modelo (5 tentativas x 6 páginas, com esperas
+# crescentes) sem resultado. Modelos gratuitos ficam saturados com
+# frequência, e a OpenRouter também limita requisições por minuto/dia nas
+# contas gratuitas. Agora um 429 coloca o modelo "de molho" por 60s e o
+# sistema passa NA HORA para o próximo da fila (cada modelo tem seu próprio
+# limite). Só espera se TODOS estiverem de molho. Se o 429 for o limite
+# DIÁRIO da conta, não adianta tentar mais nada: o run avisa claramente e
+# falha rápido, em vez de ficar rodando em vão.
+_MODELOS_DE_MOLHO = {}  # modelo -> instante (time.time) em que volta a ser usado
+_LIMITE_DIARIO_ATINGIDO = [False]
+ESPERA_MODELO_429_S = 60
+ORCAMENTO_POR_PAGINA_S = 300  # no máximo ~5 min tentando UMA página
+
+
 def _proximo_modelo_disponivel():
-    for modelo in _obter_ordem_de_modelos():
-        if modelo not in _MODELOS_INDISPONIVEIS:
-            return modelo
-    return None
+    """Devolve o próximo modelo utilizável agora. Se todos os vivos estão de
+    molho (429), dorme até o primeiro voltar. Devolve None se não sobrou nenhum."""
+    vivos = [m for m in _obter_ordem_de_modelos() if m not in _MODELOS_INDISPONIVEIS]
+    if not vivos:
+        return None
+    agora = time.time()
+    prontos = [m for m in vivos if _MODELOS_DE_MOLHO.get(m, 0) <= agora]
+    if prontos:
+        return prontos[0]
+    volta = min(_MODELOS_DE_MOLHO[m] for m in vivos)
+    espera = max(1, volta - agora)
+    print(f"  [modelos] todos em limite de requisições; aguardando {espera:.0f}s...", file=sys.stderr)
+    time.sleep(espera)
+    return _proximo_modelo_disponivel()
 
 # Texto de busca: mesmo padrão default do serviço. Pode sobrescrever com a env
 # var TEXTO_PESQUISA se preferir usar "Funed" como no fluxo n8n antigo.
@@ -755,7 +781,18 @@ def _chamar_llm_para_pagina(pagina):
     # pedido, sem acesso) NÃO gastam tentativas: trocam de modelo na hora.
     trocas_de_modelo = 0
     sem_response_format = set()
+    inicio_pagina = time.time()
     while tentativa < MAX_TENTATIVAS:
+        if _LIMITE_DIARIO_ATINGIDO[0]:
+            raise RuntimeError(
+                "Limite DIÁRIO de requisições gratuitas da OpenRouter atingido "
+                "(adicionar ~US$10 de crédito na conta OpenRouter libera 1000/dia)."
+            )
+        if time.time() - inicio_pagina > ORCAMENTO_POR_PAGINA_S:
+            raise RuntimeError(
+                f"Tempo máximo ({ORCAMENTO_POR_PAGINA_S}s) esgotado na página "
+                f"{pagina['numero']}; último erro: {ultimo_erro}"
+            )
         modelo = _proximo_modelo_disponivel()
         if modelo is None:
             raise RuntimeError(
@@ -779,6 +816,23 @@ def _chamar_llm_para_pagina(pagina):
                 json=corpo,
                 timeout=180,
             )
+            if resp.status_code == 429:
+                corpo_429 = resp.text[:500]
+                print(
+                    f"  [página {pagina['numero']}] modelo {modelo} respondeu 429: {corpo_429!r}",
+                    file=sys.stderr,
+                )
+                minusc = corpo_429.lower()
+                if "per-day" in minusc or "per day" in minusc:
+                    _LIMITE_DIARIO_ATINGIDO[0] = True
+                else:
+                    _MODELOS_DE_MOLHO[modelo] = time.time() + ESPERA_MODELO_429_S
+                ultimo_erro = f"{modelo}: HTTP 429"
+                tentativa -= 1
+                trocas_de_modelo += 1
+                if trocas_de_modelo > 40:
+                    raise RuntimeError(f"Excesso de trocas de modelo: {ultimo_erro}")
+                continue
             if resp.status_code in (400, 402, 403, 404):
                 detalhe = resp.text[:400]
                 print(
@@ -789,7 +843,7 @@ def _chamar_llm_para_pagina(pagina):
                 ultimo_erro = f"{modelo}: HTTP {resp.status_code}"
                 tentativa -= 1  # erro de modelo não consome tentativa
                 trocas_de_modelo += 1
-                if trocas_de_modelo > 25:
+                if trocas_de_modelo > 40:
                     raise RuntimeError(f"Excesso de trocas de modelo: {ultimo_erro}")
                 if resp.status_code in (400, 404) and modelo not in sem_response_format:
                     # alguns modelos não aceitam response_format: tenta o MESMO
