@@ -523,9 +523,57 @@ def montar_prompt_usuario_pagina(pagina):
             f"primeira ou segunda menção."
         )
 
+    # CORREÇÃO 06/11/2026: SEGUNDA PASSADA de conferência. Quando a 1ª passada
+    # deixa dúvida (página com mais menções à FUNED do que o esperado pelas
+    # publicações extraídas, ou página sem nenhuma publicação), em vez de só
+    # AVISAR a equipe no e-mail ("verificação manual recomendada" — que
+    # passou a aparecer todo dia e a tirar a credibilidade do resumo), o
+    # sistema faz uma conferência: manda à IA a lista do que JÁ foi
+    # identificado e pede só o que estiver FALTANDO. Se não faltar nada, a
+    # dúvida é resolvida e o aviso não aparece.
+    bloco_conferencia = ""
+    ja_identificadas = pagina.get("pubs_ja_identificadas")
+    if ja_identificadas is not None:
+        if ja_identificadas:
+            linhas = []
+            for n, p in enumerate(ja_identificadas, 1):
+                pessoas = ", ".join(
+                    str(x.get("nome", "")) if isinstance(x, dict) else str(x)
+                    for x in (p.get("pessoas") or [])
+                )
+                linhas.append(
+                    f"{n}. {p.get('tipo_do_ato', '?')} — {pessoas or 'sem pessoa citada'} — "
+                    f"{(p.get('trecho_verificacao') or '')[:140]}"
+                )
+            lista_ja = "\n".join(linhas)
+        else:
+            lista_ja = "(nenhum ato foi identificado na primeira passada)"
+        trechos = pagina.get("trechos_mencoes_funed") or []
+        lista_mencoes = "\n".join(
+            f"- {t.strip()[:200]}" for t in trechos[:15]
+        )
+        bloco_conferencia = (
+            "\n\n--- CONFERÊNCIA (SEGUNDA PASSADA — leia com atenção) ---\n"
+            "Esta é uma segunda verificação desta MESMA página. Atos JÁ "
+            "identificados na primeira passada (NÃO os repita):\n"
+            f"{lista_ja}\n\n"
+            "Trechos onde o código encontrou menção à FUNED nesta página:\n"
+            f"{lista_mencoes}\n\n"
+            "TAREFA: confira se existe algum OUTRO ato/publicação da FUNED "
+            "(conforme as regras acima) que NÃO esteja na lista de já "
+            "identificados. Devolva em \"publicacoes\" SOMENTE os atos que "
+            "estiverem FALTANDO. Se as menções restantes forem apenas "
+            "citações incidentais, tabelas/listas de outros assuntos (ex: "
+            "projetos de pesquisa em que a FUNED é só instituição "
+            "executora), atos de outros órgãos, ou já estiverem cobertas "
+            "pelos atos listados, devolva {\"publicacoes\": []}. NÃO invente "
+            "nada e NÃO repita atos já listados."
+        )
+        bloco_checklist = ""
+
     return (
         f"--- PÁGINA {pagina['numero']} ---\n{pagina['texto']}"
-        f"{bloco_categoria}{bloco_contexto}{bloco_checklist}"
+        f"{bloco_categoria}{bloco_contexto}{bloco_checklist}{bloco_conferencia}"
     )
 
 
@@ -983,8 +1031,9 @@ def _processar_uma_pagina(pagina):
 
     publicacoes_pagina = resultado_pagina.get("publicacoes") or []
     if not publicacoes_pagina:
-        cobertura_incompleta = bool(pagina.get("trechos_mencoes_funed"))
-        return [], False, cobertura_incompleta
+        # Página que o app.py confirmou conter o termo mas ficou SEM nenhuma
+        # publicação: sempre vai pra conferência (segunda passada).
+        return [], False, True
 
     # Força o número da página com o valor que a GENTE já sabe (veio do
     # serviço de raspagem), em vez de confiar no que o modelo eventualmente
@@ -1010,12 +1059,77 @@ def _processar_uma_pagina(pagina):
         print(
             f"[cobertura de menções] página {pagina['numero']}: nem toda menção "
             f"distinta a FUNED/Fundação Ezequiel Dias ficou representada nas "
-            f"publicações extraídas — possível ato perdido. Vai entrar no aviso "
-            f"de verificação manual do e-mail.",
+            f"publicações extraídas — possível ato perdido. Vai passar pela "
+            f"conferência (2ª passada) antes de qualquer aviso.",
             file=sys.stderr,
         )
 
     return publicacoes_validas, False, cobertura_incompleta
+
+
+def _eh_duplicata(nova, existentes):
+    """True se 'nova' já está representada em 'existentes' (mesma página):
+    mesmo início do trecho de verificação, ou mesmo tipo de ato + mesmas
+    pessoas."""
+    trecho_novo = _normalizar(nova.get("trecho_verificacao") or "")[:80]
+    nomes_novos = {
+        _normalizar(x.get("nome", "") if isinstance(x, dict) else str(x))
+        for x in (nova.get("pessoas") or [])
+    }
+    tipo_novo = _normalizar(nova.get("tipo_do_ato") or "")
+    for ex in existentes:
+        trecho_ex = _normalizar(ex.get("trecho_verificacao") or "")
+        if trecho_novo and trecho_novo in trecho_ex:
+            return True
+        nomes_ex = {
+            _normalizar(x.get("nome", "") if isinstance(x, dict) else str(x))
+            for x in (ex.get("pessoas") or [])
+        }
+        if (
+            nomes_novos
+            and nomes_novos <= nomes_ex
+            and tipo_novo
+            and tipo_novo == _normalizar(ex.get("tipo_do_ato") or "")
+        ):
+            return True
+    return False
+
+
+def _conferir_pagina(pagina, publicacoes_atuais):
+    """SEGUNDA PASSADA (06/11/2026): devolve (publicacoes_novas, falhou).
+    'falhou' só é True se a chamada à IA falhou tecnicamente — nesse caso (e
+    só nesse) a página continua no aviso de verificação manual do e-mail."""
+    pagina_conf = dict(pagina)
+    pagina_conf["pubs_ja_identificadas"] = [
+        {
+            "tipo_do_ato": p.get("tipo_do_ato"),
+            "pessoas": p.get("pessoas"),
+            "trecho_verificacao": p.get("trecho_verificacao"),
+        }
+        for p in publicacoes_atuais
+    ]
+    try:
+        resultado = _chamar_llm_para_pagina(pagina_conf)
+    except Exception as e:  # noqa: BLE001
+        print(f"Falha na conferência da página {pagina['numero']}: {e}", file=sys.stderr)
+        return [], True
+
+    candidatas = resultado.get("publicacoes") or []
+    for pub in candidatas:
+        pub["pagina"] = pagina["numero"]
+    validas = [p for p in candidatas if _publicacao_atribuida_a_funed(p)]
+    novas = []
+    acumuladas = list(publicacoes_atuais)
+    for pub in validas:
+        if not _eh_duplicata(pub, acumuladas):
+            novas.append(pub)
+            acumuladas.append(pub)
+    print(
+        f"[conferência] página {pagina['numero']}: {len(candidatas)} candidata(s), "
+        f"{len(novas)} nova(s) após remover repetidas/não atribuídas à FUNED.",
+        file=sys.stderr,
+    )
+    return novas, False
 
 
 def extrair_publicacoes(paginas):
@@ -1066,73 +1180,81 @@ def extrair_publicacoes(paginas):
     # que já foi encontrado na 1ª passada: só ACRESCENTA publicações novas
     # que a retentativa conseguir achar (comparando por conteúdo oficial,
     # pra não duplicar a mesma publicação duas vezes).
-    paginas_para_retentar = list(
-        dict.fromkeys(paginas_com_falha + paginas_cobertura_incompleta)
-    )
-    if paginas_para_retentar:
+    paginas_por_numero = {p["numero"]: p for p in paginas}
+
+    # (A) Retentativa das páginas que FALHARAM por completo (ex: modelo
+    # indisponível / rate limit em todas as tentativas).
+    if paginas_com_falha:
         print(
-            f"Rodada extra ao final para {len(paginas_para_retentar)} página(s) que "
-            f"falharam ou ficaram com cobertura incompleta: {paginas_para_retentar}. "
-            f"Aguardando 45s antes de retentar...",
+            f"Rodada extra para {len(paginas_com_falha)} página(s) que falharam: "
+            f"{paginas_com_falha}. Aguardando 45s antes de retentar...",
             file=sys.stderr,
         )
         time.sleep(45)
-        paginas_por_numero = {p["numero"]: p for p in paginas}
-        paginas_com_falha_definitiva = []
-        paginas_cobertura_incompleta_definitiva = []
-        for numero in paginas_para_retentar:
+        ainda_falhas = []
+        for numero in paginas_com_falha:
             pagina = paginas_por_numero[numero]
             print(f"Retentando página {numero} (rodada extra)...", file=sys.stderr)
             publicacoes_validas, falhou, cobertura_incompleta = _processar_uma_pagina(pagina)
             if falhou:
-                paginas_com_falha_definitiva.append(numero)
-            elif publicacoes_validas:
-                ja_capturadas = _normalizar(
-                    " ".join(
-                        pub.get("trecho_verificacao") or ""
-                        for pub in todas_publicacoes
-                        if pub.get("pagina") == numero
-                    )
-                )
-                novas = [
-                    pub for pub in publicacoes_validas
-                    if _normalizar(pub.get("trecho_verificacao") or "")[:80]
-                    not in ja_capturadas
-                ]
+                ainda_falhas.append(numero)
+            else:
+                if publicacoes_validas:
+                    todas_publicacoes.extend(publicacoes_validas)
+                    if numero not in paginas_com_atos:
+                        paginas_com_atos.append(numero)
+                if cobertura_incompleta and numero not in paginas_cobertura_incompleta:
+                    paginas_cobertura_incompleta.append(numero)
+            time.sleep(8)
+        paginas_com_falha = ainda_falhas
+
+    # (B) CONFERÊNCIA (segunda passada) das páginas com dúvida de cobertura
+    # (mais menções à FUNED do que o esperado, ou nenhuma publicação). Em vez
+    # de só avisar a equipe, a IA recebe a lista do que já foi achado e
+    # procura só o que FALTA. Só continua no aviso do e-mail a página cuja
+    # conferência FALHOU tecnicamente.
+    paginas_verificadas = []
+    pendentes = []
+    if paginas_cobertura_incompleta:
+        print(
+            f"Conferência (2ª passada) das página(s): {paginas_cobertura_incompleta}.",
+            file=sys.stderr,
+        )
+        time.sleep(8)
+        for numero in list(paginas_cobertura_incompleta):
+            pagina = paginas_por_numero[numero]
+            atuais = [p for p in todas_publicacoes if p.get("pagina") == numero]
+            novas, falhou = _conferir_pagina(pagina, atuais)
+            if falhou:
+                pendentes.append(numero)
+            else:
+                paginas_verificadas.append(numero)
                 if novas:
                     todas_publicacoes.extend(novas)
+                    if numero not in paginas_com_atos:
+                        paginas_com_atos.append(numero)
                     print(
-                        f"[rodada extra] página {numero}: {len(novas)} publicação(ões) "
-                        f"nova(s) encontrada(s) na retentativa.",
+                        f"[conferência] página {numero}: {len(novas)} publicação(ões) "
+                        f"que estava(m) faltando foi(ram) recuperada(s).",
                         file=sys.stderr,
                     )
-                if numero not in paginas_com_atos:
-                    paginas_com_atos.append(numero)
-                # reconfere cobertura com o total acumulado (1ª passada + retentativa)
-                publicacoes_da_pagina = [
-                    pub for pub in todas_publicacoes if pub.get("pagina") == numero
-                ]
-                if _verificar_cobertura_mencoes(pagina, publicacoes_da_pagina):
-                    paginas_cobertura_incompleta_definitiva.append(numero)
-            elif numero in paginas_cobertura_incompleta:
-                # não achou nada de novo na retentativa — mantém o aviso.
-                paginas_cobertura_incompleta_definitiva.append(numero)
             time.sleep(8)
-        paginas_com_falha = paginas_com_falha_definitiva
-        paginas_cobertura_incompleta = paginas_cobertura_incompleta_definitiva
-        if paginas_com_falha or paginas_cobertura_incompleta:
-            print(
-                f"Após a rodada extra — falharam por completo: {paginas_com_falha}; "
-                f"cobertura ainda incompleta: {paginas_cobertura_incompleta}. "
-                f"Vão aparecer no aviso de verificação manual do e-mail.",
-                file=sys.stderr,
-            )
+    paginas_cobertura_incompleta = pendentes
+    paginas_com_atos.sort()
+    if paginas_com_falha or paginas_cobertura_incompleta:
+        print(
+            f"Após retentativa/conferência — falharam por completo: {paginas_com_falha}; "
+            f"conferência indisponível: {paginas_cobertura_incompleta}. "
+            f"Vão aparecer no aviso de verificação manual do e-mail.",
+            file=sys.stderr,
+        )
 
     resultado = {
         "paginas_com_atos": paginas_com_atos,
-        "publicacoes": todas_publicacoes,
+        "publicacoes": sorted(todas_publicacoes, key=lambda p: p.get("pagina") or 0),
         "paginas_com_falha": paginas_com_falha,
         "paginas_cobertura_incompleta": paginas_cobertura_incompleta,
+        "paginas_verificadas": paginas_verificadas,
     }
     return _filtrar_pessoas_consistentes(resultado)
 
@@ -1195,13 +1317,10 @@ def renderizar_email_html(dados):
         lista_paginas = ", ".join(str(p) for p in paginas_sem_ato_extraido)
         aviso_paginas_nao_confirmadas = f"""
         <div style="background:#fdf3e7; border-left:4px solid #d9822b; border-radius:6px; padding:16px; margin:20px 0;">
-          <p style="margin:0; color:#8a5a1e;"><strong>⚠️ Atenção — verificação manual recomendada:</strong>
-          a(s) página(s) {lista_paginas} menciona(m) "FUNED"/"Fundação Ezequiel Dias" no texto do Diário Oficial de hoje,
-          mas o resumo automático pode não ter capturado TODOS os atos presentes nela(s)
-          — seja porque nenhum ato foi identificado, seja porque a página tem mais menções
-          ao termo do que publicações extraídas (pode ter sido uma falha temporária da IA,
-          uma página muito extensa/com muitos órgãos misturados, ou um caso ambíguo).
-          Recomenda-se conferir essa(s) página(s) diretamente no Diário Oficial.</p>
+          <p style="margin:0; color:#8a5a1e;"><strong>⚠️ Atenção — análise automática incompleta:</strong>
+          não foi possível concluir a análise automática da(s) página(s) {lista_paginas} do Diário Oficial de hoje
+          (instabilidade temporária do serviço de IA), e ela(s) cita(m) "FUNED"/"Fundação Ezequiel Dias".
+          Por favor, confira essa(s) página(s) diretamente no Diário Oficial.</p>
         </div>
         """
 
@@ -1319,7 +1438,15 @@ def main():
     # transformou em publicação. A diferença vira aviso no e-mail.
     paginas_recebidas_numeros = {p["numero"] for p in paginas}
     paginas_confirmadas_numeros = set(dados.get("paginas_com_atos", []))
-    paginas_zero_publicacoes = sorted(paginas_recebidas_numeros - paginas_confirmadas_numeros)
+    paginas_verificadas = set(dados.get("paginas_verificadas", []))
+    paginas_falha_numeros = set(dados.get("paginas_com_falha", []))
+    # CORREÇÃO 06/11/2026: página sem publicação que passou pela conferência
+    # (2ª passada) SEM falha técnica foi avaliada e não tinha ato da FUNED
+    # (ex: FUNED só citada numa tabela de outro assunto) — não é motivo de aviso.
+    paginas_zero_publicacoes = sorted(
+        (paginas_recebidas_numeros - paginas_confirmadas_numeros) - paginas_verificadas
+        | (paginas_falha_numeros)
+    )
 
     # CORREÇÃO 02/10/2026 (2ª): a rede de segurança acima só pegava páginas
     # com ZERO publicações extraídas — mas a página 32 de 02/10/2026 teve 1
