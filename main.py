@@ -419,6 +419,12 @@ Regras importantes:
   outros atos (como portarias completas) que também estejam na mesma página. Mas se
   houver tabelas SEPARADAS de tipos diferentes (ex: uma de licenças DEFERIDAS e outra de
   licenças INDEFERIDAS), cada uma é uma publicação diferente — não junte as duas.
+- MESMO ATO CITANDO A FUNED EM MAIS DE UM TRECHO: se um único ato (o mesmo decreto, portaria,
+  contrato, termo aditivo, resolução etc.) cita a FUNED em mais de um lugar (ex: no corpo do
+  texto e também em uma tabela/anexo do mesmo decreto), gere UMA ÚNICA publicação para esse
+  ato, e descreva no "resumo_objetivo" tudo o que ele diz sobre a FUNED. NÃO crie uma segunda
+  publicação (como uma "menção indireta") que apenas repita ou detalhe um ato que você já
+  incluiu. Publicações separadas só para atos DIFERENTES (números diferentes).
 - "trecho_verificacao" deve ser um recorte fiel do texto original da página (não invente, não
   resuma aqui) — mas pode e deve ser CURTO, já que não aparece no e-mail final.
 - IMPORTANTE: o campo "pessoas" de uma publicação deve conter SOMENTE pessoas que também
@@ -1183,6 +1189,68 @@ def _processar_uma_pagina(pagina):
     return publicacoes_validas, False, cobertura_incompleta
 
 
+# CORREÇÃO 06/11/2026: o mesmo ato (ex: Decreto NE nº 1.070) que cita a FUNED em
+# dois trechos (corpo + anexo) virava DOIS cards no e-mail. Além da regra no
+# prompt, esta unificação determinística junta, por página, publicações que
+# se referem ao MESMO ato (mesmo tipo + mesmo número no "tipo_do_ato").
+_RE_ATO_NUMERADO = re.compile(
+    r"(termo\s+aditivo|decreto|portaria|resolu[cç][aã]o|contrato|edital|despacho|conv[eê]nio)"
+    r"\b[^0-9]{0,25}?n[ºo°.]*\s*(\d[\d.\s]{0,12}\d(?:\s*/\s*\d{2,4})?)",
+    re.IGNORECASE,
+)
+
+
+def _chave_do_ato(pub):
+    """('decreto', '1070') para 'Decreto NE nº 1.070 – ...'; None se não houver número."""
+    m = _RE_ATO_NUMERADO.search(pub.get("tipo_do_ato") or "")
+    if not m:
+        return None
+    tipo = _normalizar(m.group(1))
+    numero = re.sub(r"[^\d/]", "", m.group(2))
+    return (tipo, numero) if numero else None
+
+
+def _unificar_publicacoes_do_mesmo_ato(publicacoes):
+    """Junta, dentro da mesma página, publicações do MESMO ato numerado. Mantém a
+    de categoria 'ato próprio da FUNED' (ou a de resumo mais completo) e une as
+    pessoas. Publicações sem número identificável nunca são mexidas."""
+    resultado = []
+    indice = {}
+    for pub in publicacoes:
+        chave = _chave_do_ato(pub)
+        if chave is None:
+            resultado.append(pub)
+            continue
+        k = (pub.get("pagina"), chave)
+        if k not in indice:
+            indice[k] = len(resultado)
+            resultado.append(pub)
+            continue
+        atual = resultado[indice[k]]
+
+        def _peso(p):
+            proprio = "próprio" in _normalizar(p.get("categoria") or "") or "proprio" in _normalizar(p.get("categoria") or "")
+            return (1 if proprio else 0, len(p.get("resumo_objetivo") or ""))
+
+        principal, outra = (pub, atual) if _peso(pub) > _peso(atual) else (atual, pub)
+        nomes = {
+            _normalizar(x.get("nome", "") if isinstance(x, dict) else str(x))
+            for x in (principal.get("pessoas") or [])
+        }
+        for x in outra.get("pessoas") or []:
+            nome = _normalizar(x.get("nome", "") if isinstance(x, dict) else str(x))
+            if nome and nome not in nomes:
+                principal.setdefault("pessoas", []).append(x)
+                nomes.add(nome)
+        resultado[indice[k]] = principal
+        print(
+            f"[unificação] página {pub.get('pagina')}: publicações do mesmo ato "
+            f"{chave[0]} nº {chave[1]} unificadas em uma só.",
+            file=sys.stderr,
+        )
+    return resultado
+
+
 def _eh_duplicata(nova, existentes):
     """True se 'nova' já está representada em 'existentes' (mesma página):
     mesmo início do trecho de verificação, ou mesmo tipo de ato + mesmas
@@ -1367,7 +1435,10 @@ def extrair_publicacoes(paginas):
 
     resultado = {
         "paginas_com_atos": paginas_com_atos,
-        "publicacoes": sorted(todas_publicacoes, key=lambda p: p.get("pagina") or 0),
+        "publicacoes": sorted(
+            _unificar_publicacoes_do_mesmo_ato(todas_publicacoes),
+            key=lambda p: p.get("pagina") or 0,
+        ),
         "paginas_com_falha": paginas_com_falha,
         "paginas_cobertura_incompleta": paginas_cobertura_incompleta,
         "paginas_verificadas": paginas_verificadas,
