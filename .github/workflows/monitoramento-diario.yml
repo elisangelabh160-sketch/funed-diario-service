@@ -23,8 +23,11 @@ jobs:
           python-version: "3.11"
       - name: Instalar dependências
         run: pip install -r requirements.txt
+      - name: Instalar Claude Code
+        run: sudo npm install -g @anthropic-ai/claude-code
       - name: Rodar monitoramento e enviar e-mail
         env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           RENDER_BASE_URL: ${{ secrets.RENDER_BASE_URL }}
           SERVICE_API_KEY: ${{ secrets.SERVICE_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
