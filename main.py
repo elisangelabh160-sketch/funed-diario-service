@@ -800,7 +800,123 @@ def _filtrar_pessoas_consistentes(dados):
     return dados
 
 
+# --------------------------------------------------------------------------
+# CORREÇÃO 06/11/2026: análise pelo CLAUDE (assinatura Pro/Max) em vez de
+# depender só dos modelos gratuitos da OpenRouter (que somem, ficam saturados
+# e erram mais). Se existir o secret CLAUDE_CODE_OAUTH_TOKEN (gerado com
+# `claude setup-token`, usa a assinatura — sem cobrança extra de API), cada
+# página é analisada pelo Claude Code em modo não interativo (`claude -p`),
+# sem nenhuma ferramenta (só lê o texto e devolve o JSON). A OpenRouter
+# continua como RESERVA automática: se o Claude falhar (limite da assinatura,
+# token vencido, CLI ausente), o sistema segue pelo caminho antigo.
+# --------------------------------------------------------------------------
+CLAUDE_MODELO = os.environ.get("CLAUDE_MODELO", "sonnet")
+_CLAUDE_INDISPONIVEL = [False]
+
+
+_CLAUDE_DIAGNOSTICO_IMPRESSO = [False]
+
+
+def _claude_disponivel():
+    import shutil
+
+    tem_token = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip())
+    caminho_cli = shutil.which("claude")
+    if not _CLAUDE_DIAGNOSTICO_IMPRESSO[0]:
+        # Diagnóstico (uma vez por execução): mostra POR QUE o Claude entrou
+        # ou não — nunca imprime o token, só se ele existe.
+        _CLAUDE_DIAGNOSTICO_IMPRESSO[0] = True
+        print(
+            f"[claude] token CLAUDE_CODE_OAUTH_TOKEN configurado: "
+            f"{'SIM' if tem_token else 'NÃO (secret vazio/ausente)'}; "
+            f"programa 'claude' encontrado: {caminho_cli or 'NÃO'}",
+            file=sys.stderr,
+        )
+    if _CLAUDE_INDISPONIVEL[0]:
+        return False
+    return tem_token and caminho_cli is not None
+
+
+def _chamar_claude_cli_para_pagina(pagina):
+    """Analisa UMA página com o Claude Code (assinatura). Devolve o dict com
+    "publicacoes" ou levanta exceção (o chamador cai na OpenRouter)."""
+    import subprocess
+
+    ambiente = dict(os.environ)
+    ambiente.pop("ANTHROPIC_API_KEY", None)  # a chave de API tem prioridade e cobraria à parte
+    comando = [
+        "claude", "-p",
+        "--output-format", "json",
+        "--model", CLAUDE_MODELO,
+        "--system-prompt", PROMPT_SISTEMA,
+        "--tools", "",
+        "--no-session-persistence",
+    ]
+    ultimo_erro = None
+    for tentativa in range(1, 3):
+        try:
+            proc = subprocess.run(
+                comando,
+                input=montar_prompt_usuario_pagina(pagina),
+                capture_output=True,
+                text=True,
+                timeout=420,
+                env=ambiente,
+            )
+            if proc.returncode != 0:
+                detalhe = (proc.stderr or "").strip()
+                try:
+                    detalhe = detalhe or str(json.loads(proc.stdout).get("result"))
+                except Exception:  # noqa: BLE001
+                    detalhe = detalhe or (proc.stdout or "")[:300]
+                raise RuntimeError(f"claude saiu com código {proc.returncode}: {detalhe[:500]}")
+            saida = json.loads(proc.stdout)
+            if saida.get("is_error"):
+                raise RuntimeError(f"claude devolveu erro: {str(saida.get('result'))[:500]}")
+            texto = saida.get("result") or ""
+            resultado = _extrair_json(texto)
+            print(
+                f"  [página {pagina['numero']} / claude tentativa {tentativa}] resposta recebida "
+                f"({len(texto)} caractere(s)) do Claude (assinatura).",
+                file=sys.stderr,
+            )
+            if not resultado.get("publicacoes"):
+                print(
+                    f"  [página {pagina['numero']}] Claude devolveu JSON válido mas SEM "
+                    f"publicações (resposta bruta): {texto[:1500]!r}",
+                    file=sys.stderr,
+                )
+            return resultado
+        except Exception as e:  # noqa: BLE001
+            ultimo_erro = e
+            print(
+                f"  [página {pagina['numero']} / claude tentativa {tentativa}] erro: {e}",
+                file=sys.stderr,
+            )
+            texto_erro = str(e).lower()
+            if any(x in texto_erro for x in ("limit", "401", "403", "auth", "login", "token", "not found", "no such file")):
+                _CLAUDE_INDISPONIVEL[0] = True  # não adianta insistir nesta execução
+                break
+            time.sleep(5)
+    raise RuntimeError(f"Claude (assinatura) falhou na página {pagina['numero']}: {ultimo_erro}")
+
+
 def _chamar_llm_para_pagina(pagina):
+    """Analisa UMA página: primeiro pelo Claude (assinatura) se configurado;
+    se não der, pela OpenRouter (fila de modelos gratuitos)."""
+    if _claude_disponivel():
+        try:
+            return _chamar_claude_cli_para_pagina(pagina)
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"  [página {pagina['numero']}] Claude indisponível ({e}); "
+                f"usando a OpenRouter como reserva.",
+                file=sys.stderr,
+            )
+    return _chamar_openrouter_para_pagina(pagina)
+
+
+def _chamar_openrouter_para_pagina(pagina):
     """Faz a chamada à OpenRouter para o texto de UMA única página e devolve o
     JSON já extraído (dict com "publicacoes"). Repete em caso de erro."""
     corpo = {
