@@ -1163,6 +1163,7 @@ def _processar_uma_pagina(pagina):
     # páginas trocadas entre publicações.
     for pub in publicacoes_pagina:
         pub["pagina"] = pagina["numero"]
+        _normalizar_pessoas(pub)
 
     publicacoes_validas = [
         pub for pub in publicacoes_pagina if _publicacao_atribuida_a_funed(pub)
@@ -1301,6 +1302,7 @@ def _conferir_pagina(pagina, publicacoes_atuais):
     candidatas = resultado.get("publicacoes") or []
     for pub in candidatas:
         pub["pagina"] = pagina["numero"]
+        _normalizar_pessoas(pub)
     validas = [p for p in candidatas if _publicacao_atribuida_a_funed(p)]
     novas = []
     acumuladas = list(publicacoes_atuais)
@@ -1450,10 +1452,44 @@ def extrair_publicacoes(paginas):
 # 3. Renderizar o e-mail no mesmo layout visual do fluxo n8n atual
 # --------------------------------------------------------------------------
 
+def _normalizar_pessoas(pub):
+    """CORREÇÃO 18/11/2026: o e-mail de 18/11 NÃO foi enviado porque uma pessoa
+    veio da IA sem a chave 'nome' (KeyError: 'nome' ao montar o card). A IA às
+    vezes devolve a pessoa como texto simples, com outro nome de campo ('name',
+    'nome_completo') ou sem MASP. Esta função padroniza TODA pessoa para
+    {'nome','masp','adm'} e descarta entradas vazias — assim nenhum formato
+    inesperado derruba o envio."""
+    brutas = pub.get("pessoas") or []
+    if not isinstance(brutas, (list, tuple)):
+        brutas = [brutas]
+    saida = []
+    for p in brutas:
+        if isinstance(p, str):
+            nome, masp, adm = p.strip(), "", ""
+        elif isinstance(p, dict):
+            nome = str(p.get("nome") or p.get("name") or p.get("nome_completo") or "").strip()
+            masp = str(p.get("masp") or p.get("MASP") or "").strip()
+            adm = str(p.get("adm") or "").strip()
+        else:
+            continue
+        if not nome and not masp:
+            continue
+        saida.append(
+            {
+                "nome": nome,
+                "masp": masp,
+                "adm": adm,
+            }
+        )
+    pub["pessoas"] = saida
+    return saida
+
+
 def _card_publicacao(idx, pub):
     pessoas_html = "<br>".join(
-        f"{p['nome']} — MASP {p['masp']}" + (f" — {p['adm']}" if p.get("adm") else "")
-        for p in pub.get("pessoas", [])
+        f"{p['nome'] or 'nome não informado'} — MASP {p['masp'] or 'não informado'}"
+        + (f" — {p['adm']}" if p.get("adm") else "")
+        for p in _normalizar_pessoas(pub)
     ) or "Não informado"
 
     return f"""
@@ -1467,6 +1503,22 @@ def _card_publicacao(idx, pub):
       <p style="margin:6px 0;"><strong>Data ou período:</strong> {pub.get('data_periodo', 'não informado')}</p>
       <p style="margin:6px 0;"><strong>Pessoa(s) relacionada(s):</strong><br>{pessoas_html}</p>
       <p style="margin:6px 0;"><strong style="color:#7a1626;">Resumo objetivo</strong></p>
+      <p style="margin:0; color:#4a4d52;">{pub.get('resumo_objetivo', '')}</p>
+    </div>
+    """
+
+
+def _card_publicacao_seguro(idx, pub):
+    """Monta o card; se algo inesperado acontecer com ESTA publicação, mostra um
+    card simplificado em vez de derrubar o envio do e-mail inteiro."""
+    try:
+        return _card_publicacao(idx, pub)
+    except Exception as e:  # noqa: BLE001
+        print(f"[card] erro ao montar a publicação {idx} (página {pub.get('pagina')}): {e!r}", file=sys.stderr)
+        return f"""
+    <div style="border:1px solid #e2e8f0; border-left:4px solid #7a1626; border-radius:6px; padding:16px; margin-bottom:16px; background:#f4f4f5;">
+      <h3 style="margin:0 0 12px 0; color:#7a1626; font-size:17px;">{idx} — Página {pub.get('pagina', '?')}</h3>
+      <p style="margin:6px 0;"><strong>Tipo do ato:</strong> {pub.get('tipo_do_ato', 'não informado')}</p>
       <p style="margin:0; color:#4a4d52;">{pub.get('resumo_objetivo', '')}</p>
     </div>
     """
@@ -1487,7 +1539,7 @@ def renderizar_email_html(dados):
     else:
         aviso_sem_resultado = ""
         cards_html = "".join(
-            _card_publicacao(i + 1, pub) for i, pub in enumerate(publicacoes)
+            _card_publicacao_seguro(i + 1, pub) for i, pub in enumerate(publicacoes)
         )
 
     # CORREÇÃO 18/09/2026 — Rede de segurança: se alguma página que o app.py
@@ -1652,7 +1704,26 @@ def main():
             file=sys.stderr,
         )
 
-    html = renderizar_email_html(dados)
+    try:
+        html = renderizar_email_html(dados)
+    except Exception as e:  # noqa: BLE001
+        # Última rede de segurança (18/11/2026): se por qualquer motivo o layout
+        # completo falhar, o e-mail NUNCA deixa de sair — vai uma versão simples
+        # com o essencial de cada publicação.
+        print(f"[ERRO ao montar o layout do e-mail: {e!r}] enviando versão simplificada.", file=sys.stderr)
+        itens = "".join(
+            f"<li><strong>Página {p.get('pagina', '?')}</strong> — {p.get('tipo_do_ato', '')}: "
+            f"{p.get('resumo_objetivo', '')}</li>"
+            for p in dados.get("publicacoes", [])
+        ) or "<li>Nenhuma publicação identificada.</li>"
+        link = dados.get("link_edicao")
+        link_html = f'<p><a href="{link}">Abrir edição completa no portal do Diário Oficial</a></p>' if link else ""
+        html = (
+            f"<html><body style='font-family:Arial,sans-serif;'>"
+            f"<h2>Monitoramento do Diário Oficial — FUNED — {DATA_HOJE_BR}</h2>"
+            f"<p>(Versão simplificada: houve um problema na formatação do relatório.)</p>"
+            f"{link_html}<ul>{itens}</ul></body></html>"
+        )
     enviar_email(html, DESTINATARIOS)
 
     print("Concluído com sucesso.")
